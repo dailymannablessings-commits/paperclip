@@ -907,6 +907,15 @@ can update an entry only after the current account's summary confirms access.
 The first healthy live subscription reconciles domain data without re-fetching
 session and health; reconnects and visibility recovery retain full reconciliation.
 
+### Run history authorization reads
+
+Run history reuses the authorization service's batch read API for distinct task
+bindings. Existence checks remain company-scoped and use batches of at most 500
+IDs. Missing or foreign tasks stay unreadable in every privacy mode. The batch
+snapshot lasts for one request only; the next request checks current grants,
+membership, and run restrictions again. Adapters that expose only `decide`
+retain the individual-read path with duplicate bindings shared within the request.
+
 ### Local Linux runner qualification
 
 Before serving requests, the server reads `getconf GNU_LIBC_VERSION` once with

@@ -459,6 +459,105 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
       process.env.PAPERCLIP_ISSUE_PRIVACY_MODE = "enforce";
     }
   });
+  it("batches distinct issue bindings without changing current authorization decisions", async () => {
+    const fixture = await seedFixture();
+    const ids = Array.from({ length: 64 }, () => randomUUID());
+    await db.insert(issues).values(ids.map((id, index) => ({
+      id, companyId: fixture.companyId, title: `History ${index}`, status: "in_progress",
+      visibility: index % 2 ? "private" : "open", privacyRootIssueId: index % 2 ? id : null,
+      assigneeAgentId: fixture.ownerAgentId, responsibleUserId: fixture.ownerUserId,
+    })));
+    const queries: string[] = [];
+    const observedDb = drizzle(db.$client, { schema, logger: { logQuery(query) { queries.push(query); } } }) as typeof db;
+    const access = authorizationService(observedDb);
+    const actor = { type: "agent" as const, companyId: fixture.companyId, agentId: fixture.grantedAgentId };
+    const bindings = [...ids, fixture.issueId].map(issueId => ({ companyId: fixture.companyId, scopeKind: "issue" as const, issueId }));
+    const runs = [...bindings, ...bindings, { ...bindings[0], companyId: randomUUID() },
+      { ...bindings[0], issueId: randomUUID() }, { companyId: fixture.companyId, scopeKind: "company" as const },
+      { companyId: fixture.companyId, scopeKind: "issue" as const }];
+    const individual = await getHeartbeatRunReadDecisions(observedDb, { decide: access.decide }, actor, runs);
+    const individualCount = queries.length;
+    queries.length = 0;
+    const batched = await getHeartbeatRunReadDecisions(observedDb, access, actor, runs);
+    expect(batched).toEqual(individual);
+    expect(batched.slice(0, 64)).toEqual(ids.map((_, index) => index % 2 === 0));
+    expect(batched.at(64)).toBe(true);
+    expect(batched.slice(-4)).toEqual([false, false, true, false]);
+    expect(queries.length).toBeLessThan(25);
+    expect(queries.length).toBeLessThan(individualCount / 4);
+    await db.update(issueAccessGrants).set({ revokedAt: new Date() }).where(eq(issueAccessGrants.subjectId, fixture.grantedAgentId));
+    expect((await getHeartbeatRunReadDecisions(observedDb, access, actor, runs)).at(64)).toBe(false);
+  });
+
+  it.each(["enforce", "shadow", "off"])("keeps missing and foreign issue bindings closed in %s mode", async mode => {
+    const fixture = await seedFixture();
+    process.env.PAPERCLIP_ISSUE_PRIVACY_MODE = mode;
+    try {
+      const access = authorizationService(db);
+      const actor = { type: "board" as const, userId: fixture.ownerUserId };
+      const binding = { companyId: fixture.companyId, scopeKind: "issue" as const, issueId: fixture.issueId };
+      const runs = [binding, { ...binding, issueId: randomUUID() }, { ...binding, companyId: randomUUID() }];
+      const expected = await getHeartbeatRunReadDecisions(db, { decide: access.decide }, actor, runs);
+      expect(await getHeartbeatRunReadDecisions(db, access, actor, runs)).toEqual(expected);
+      expect(expected).toEqual([true, false, false]);
+      await db.delete(companyMemberships).where(eq(companyMemberships.principalId, fixture.ownerUserId));
+      expect(await getHeartbeatRunReadDecisions(db, access, actor, [binding])).toEqual(
+        await getHeartbeatRunReadDecisions(db, { decide: access.decide }, actor, [binding]),
+      );
+    } finally { process.env.PAPERCLIP_ISSUE_PRIVACY_MODE = "enforce"; }
+  });
+
+  it("checks more than 500 task bindings with bounded company-scoped queries", async () => {
+    const fixture = await seedFixture();
+    const ids = Array.from({ length: 501 }, () => randomUUID());
+    await db.insert(issues).values(ids.map((id, index) => ({
+      id, companyId: fixture.companyId, title: `Batch ${index}`, visibility: "open", status: "in_progress",
+    })));
+    const queries: { query: string; params: unknown[] }[] = [];
+    const observedDb = drizzle(db.$client, { schema, logger: { logQuery(query, params) { queries.push({ query, params }); } } }) as typeof db;
+    const access = authorizationService(observedDb);
+    const actor = { type: "agent" as const, companyId: fixture.companyId, agentId: fixture.ownerAgentId };
+    const runs = ids.map(issueId => ({ companyId: fixture.companyId, scopeKind: "issue" as const, issueId }));
+    expect(await getHeartbeatRunReadDecisions(observedDb, access, actor, runs)).toEqual(ids.map(() => true));
+    const existence = queries.filter(({ query }) => query.startsWith('select "id" from "issues"'));
+    expect(existence.map(({ params }) => params.length).sort((a, b) => a - b)).toEqual([2, 501]);
+    expect(existence.every(({ query, params }) => query.includes('"company_id"') && params[0] === fixture.companyId)).toBe(true);
+  });
+
+  it("captures batch inputs before awaiting reads and rejects a failed batch", async () => {
+    const fixture = await seedFixture();
+    const access = authorizationService(db);
+    const actor = { type: "agent" as const, companyId: fixture.companyId, agentId: fixture.ownerAgentId };
+    const binding = { companyId: fixture.companyId, scopeKind: "issue" as const, issueId: fixture.issueId };
+    const decideReads = vi.spyOn(access, "decideReads");
+    const pending = getHeartbeatRunReadDecisions(db, access, actor, [binding, binding]);
+    binding.issueId = randomUUID();
+    expect(await pending).toEqual([true, true]);
+    expect(decideReads).toHaveBeenCalledExactlyOnceWith(actor, [expect.objectContaining({ issueId: fixture.issueId })]);
+    const error = new Error("authorization unavailable");
+    decideReads.mockRejectedValueOnce(error);
+    const current = { ...binding, issueId: fixture.issueId };
+    await expect(getHeartbeatRunReadDecisions(db, access, actor, [current])).rejects.toBe(error);
+    const transient = Object.assign(new Error("temporary disconnect"), { code: "CONNECTION_CLOSED" });
+    decideReads.mockRejectedValueOnce(transient);
+    expect(await getHeartbeatRunReadDecisions(db, access, actor, [current])).toEqual([true]);
+  });
+
+  it("does no database or authorization work for company-only or empty batches", async () => {
+    const fixture = await seedFixture();
+    const queries: string[] = [];
+    const observedDb = drizzle(db.$client, { schema, logger: { logQuery(query) { queries.push(query); } } }) as typeof db;
+    const access = authorizationService(observedDb);
+    const decideReads = vi.spyOn(access, "decideReads");
+    const actor = { type: "agent" as const, companyId: fixture.companyId, agentId: fixture.ownerAgentId };
+    expect(await getHeartbeatRunReadDecisions(observedDb, access, actor, [])).toEqual([]);
+    expect(await getHeartbeatRunReadDecisions(observedDb, access, actor, [
+      { companyId: fixture.companyId, scopeKind: "company" }, { companyId: fixture.companyId, scopeKind: "issue" },
+    ])).toEqual([true, false]);
+    expect(queries).toEqual([]);
+    expect(decideReads).not.toHaveBeenCalled();
+  });
+
   it.each(["owner", "outsider"])("checks concurrent duplicate issue runs once for the %s", async (viewer) => {
     const fixture = await seedFixture();
     const access = authorizationService(db);
@@ -469,7 +568,7 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
       agentId: viewer === "owner" ? fixture.ownerAgentId : fixture.otherAgentId,
     };
     const binding = { companyId: fixture.companyId, scopeKind: "issue" as const, issueId: fixture.issueId };
-    const decisions = await getHeartbeatRunReadDecisions(db, access, actor, Array.from({ length: 200 }, () => ({ ...binding })));
+    const decisions = await getHeartbeatRunReadDecisions(db, { decide: access.decide }, actor, Array.from({ length: 200 }, () => ({ ...binding })));
     expect(decisions).toEqual(Array(200).fill(viewer === "owner"));
     expect(decide).toHaveBeenCalledTimes(1);
     decide.mockRestore();
@@ -493,7 +592,7 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
     const decide = vi.spyOn(access, "decide");
     const actor = { type: "agent" as const, companyId: fixture.companyId, agentId: fixture.ownerAgentId };
     const binding = { companyId: fixture.companyId, scopeKind: "issue" as const, issueId: fixture.issueId };
-    const pending = getHeartbeatRunReadDecisions(db, access, actor, [binding, binding]);
+    const pending = getHeartbeatRunReadDecisions(db, { decide: access.decide }, actor, [binding, binding]);
     binding.issueId = randomUUID();
     expect(await pending).toEqual([true, true]);
     expect(decide).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
@@ -567,7 +666,7 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
     const decide = vi.spyOn(access, "decide").mockRejectedValue(error);
     const actor = { type: "agent" as const, companyId: fixture.companyId, agentId: fixture.ownerAgentId };
     const binding = { companyId: fixture.companyId, scopeKind: "issue" as const, issueId: fixture.issueId };
-    await expect(getHeartbeatRunReadDecisions(db, access, actor, Array(20).fill(binding))).rejects.toBe(error);
+    await expect(getHeartbeatRunReadDecisions(db, { decide: access.decide }, actor, Array(20).fill(binding))).rejects.toBe(error);
     expect(decide).toHaveBeenCalledTimes(1);
     decide.mockRestore();
     expect(await getHeartbeatRunReadDecisions(db, access, actor, [binding])).toEqual([true]);
