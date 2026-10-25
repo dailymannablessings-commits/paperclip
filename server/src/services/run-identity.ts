@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, inArray, sql } from "drizzle-orm";
 import {
   agentWakeupRequests,
   heartbeatRuns,
@@ -434,12 +434,22 @@ export async function acceptSteeredIdentity(
 export async function captureRunIdentity(
   db: Db,
   input: { companyId: string; runId: string; agentId: string },
+  options?: { readScope: "github_credentials" },
 ) {
   // Lock acquisition serializes with steering delivery and its durable acknowledgement.
   return db.transaction(async (tx) => {
     await lockIdentityTask(tx, input.companyId, input.runId);
     const [run] = await tx
-      .select()
+      .select(options?.readScope === "github_credentials" ? {
+        ...getTableColumns(heartbeatRuns),
+        contextSnapshot: sql<Record<string, unknown> | null>`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
+          then jsonb_build_object('issueId', ${heartbeatRuns.contextSnapshot}->'issueId',
+            'taskId', ${heartbeatRuns.contextSnapshot}->'taskId', 'projectId', ${heartbeatRuns.contextSnapshot}->'projectId',
+            'executionPolicy', ${heartbeatRuns.contextSnapshot}->'executionPolicy') else null end`,
+        runnerProfileJson: sql<Record<string, unknown> | null>`null`,
+        resultJson: sql<Record<string, unknown> | null>`null`,
+        stdoutExcerpt: sql<string | null>`null`, stderrExcerpt: sql<string | null>`null`,
+      } : getTableColumns(heartbeatRuns))
       .from(heartbeatRuns)
       .where(
         and(

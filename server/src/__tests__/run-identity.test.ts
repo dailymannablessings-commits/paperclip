@@ -29,6 +29,23 @@ const support = await getEmbeddedPostgresTestSupport();
     }
     return { companyId, agentId, issueId, runId, messageIds };
   }
+  it("retains typed GitHub trust bindings and keeps other identity reads complete", async () => {
+    const input = await seed();
+    await initializeRunIdentity(db, { ...input, responsibleUserId: "owner", cause: "queued" });
+    for (const value of [null, true, 42, " padded ", [], {}, { future: { opaque: true } }]) {
+      const contextSnapshot = { issueId: input.issueId, projectId: value, executionPolicy: value, savedInput: { retained: true } };
+      const runnerProfileJson = { nativeExecutionInput: { opaque: value }, savedInput: "retained" };
+      await db.update(heartbeatRuns).set({ contextSnapshot, runnerProfileJson }).where(eq(heartbeatRuns.id, input.runId));
+      const narrow = await captureRunIdentity(db, input, { readScope: "github_credentials" });
+      expect(narrow.run.contextSnapshot).toEqual({ issueId: input.issueId, taskId: null, projectId: value, executionPolicy: value });
+      expect(narrow.run.runnerProfileJson).toBeNull();
+      const full = await captureRunIdentity(db, input);
+      expect(full.run.contextSnapshot).toEqual(contextSnapshot);
+      expect(full.run.runnerProfileJson).toEqual(runnerProfileJson);
+      expect(narrow.context).toEqual(full.context);
+    }
+  });
+
   it("retains mixed-author delivery order without rewriting task ownership", async () => {
     const input = await seed();
     await initializeRunIdentity(db, { ...input, responsibleUserId: "owner", cause: "queued" });
