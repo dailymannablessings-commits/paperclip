@@ -1,3 +1,4 @@
+import { isStaleTerminalAssigneeWake } from "../domain/terminal-wake.js";
 import { enrichPromotedWakeContext } from "../domain/context.js";
 import {
   decideQueuedCommentAction,
@@ -356,9 +357,7 @@ async function promoteDeferredWake(
   // continuations cannot revive assignee execution. Cancel before claiming promotion so
   // the compare-and-set still sees the deferred wake.
   if (
-    !shouldReopen &&
-    (currentIssue.status === "done" || currentIssue.status === "cancelled") &&
-    workingCandidate.agentId === currentIssue.assigneeAgentId
+    isStaleTerminalAssigneeWake(currentIssue, workingCandidate, shouldReopen)
   ) {
     await ports.transaction.cancelDeferredWake({
       companyId: run.companyId,
