@@ -1,3 +1,4 @@
+import type { TaskExecutionLeaseRequest } from "@paperclipai/shared";
 import { createHash } from 'node:crypto';
 
 export const PAUSED_TASK_LEASE_KEY = 'pausedTaskExecutionLease';
@@ -8,6 +9,7 @@ const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 export type JsonObject = Record<string, unknown>;
 export function canonicalHash(value: unknown): string {
   const canonical = (input: unknown): unknown => {
+    if (input instanceof Date) return input.toISOString();
     if (Array.isArray(input)) return input.map(canonical);
     if (input !== null && typeof input === 'object') return Object.fromEntries(
       Object.entries(input).sort(([a],[b]) => a < b ? -1 : a > b ? 1 : 0).map(([k,v]) => [k,canonical(v)]),
@@ -28,6 +30,7 @@ export function preservesRoleModelArgs(args: unknown[]): boolean {
 }
 export type PausedExecutionAgent = {
   id: string; companyId: string; status: string; adapterType: string;
+  role: string; capabilities: string | null; pauseReason: string | null; pausedAt: Date | string | null;
   adapterConfig: JsonObject; runtimeConfig: JsonObject; budgetMonthlyCents: number;
   reportsTo: string | null; permissions: JsonObject;
 };
@@ -46,10 +49,7 @@ export type PausedTaskLease = {
   actorUserId: string; idempotencyKey: string; headSha: string; controlHash: string;
   profileHash: string; scopeHash: string; createdAt: string; expiresAt: string;
 };
-export type PausedExecutionRequest = {
-  issueId: string; idempotencyKey: string; headSha: string; expectedControlHash: string;
-  expectedModel: string; scopeDescription: string; profile: JsonObject; expiresAt: string;
-};
+export type PausedExecutionRequest = TaskExecutionLeaseRequest;
 export type LeaseAdmission = {
   lease: PausedTaskLease; profile: JsonObject; scopeDescription: string;
 };

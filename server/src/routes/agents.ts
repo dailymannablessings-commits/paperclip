@@ -5892,7 +5892,14 @@ export function agentRoutes(
     assertBoard(req);
     const agent=await getAccessibleResource(req,res,svc.getById(req.params.id as string),"Agent not found");if(!agent)return;
     await assertBoardCanWakeAgent(req,agent);
+    // A bounded profile replaces executable transport for this task; wake-only
+    // permission must not become configuration or task-mutation authority.
+    await assertBoardCanManageAgentsForCompany(req,agent.companyId);
     if(!req.actor.userId)throw forbidden("Board user context required");
+    const [issue]=await db.select().from(issuesTable).where(and(eq(issuesTable.id,req.body.issueId),eq(issuesTable.companyId,agent.companyId)));
+    if(!issue)throw notFound("Task not found");
+    const decision=await access.decide({actor:req.actor,action:"issue:mutate",resource:{type:"issue",companyId:issue.companyId,issueId:issue.id,projectId:issue.projectId,parentIssueId:issue.parentId,assigneeAgentId:issue.assigneeAgentId,assigneeUserId:issue.assigneeUserId,status:issue.status},scope:{issueId:issue.id,projectId:issue.projectId,parentIssueId:issue.parentId,assigneeAgentId:issue.assigneeAgentId,assigneeUserId:issue.assigneeUserId}});
+    if(!decision.allowed)throw forbidden(decision.explanation,authorizationDeniedDetails(decision));
     const run=await heartbeat.invokeTaskExecutionLease(agent.id,req.actor.userId,req.body);
     res.status(202).json(run);
   });

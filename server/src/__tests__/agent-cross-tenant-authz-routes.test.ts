@@ -79,6 +79,7 @@ const mockBudgetService = vi.hoisted(() => ({
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
+  invokeTaskExecutionLease: vi.fn(),
   cancelActiveForAgent: vi.fn(),
 }));
 
@@ -241,7 +242,7 @@ async function loadRouteModules() {
   return routeModules;
 }
 
-async function createApp(actor: Record<string, unknown>) {
+async function createApp(actor: Record<string, unknown>, db: unknown = {}) {
   const [{ errorHandler }, { agentRoutes }] = await loadRouteModules();
   const app = express();
   app.use(express.json());
@@ -252,7 +253,7 @@ async function createApp(actor: Record<string, unknown>) {
     };
     next();
   });
-  app.use("/api", agentRoutes({} as any));
+  app.use("/api", agentRoutes(db as any));
   app.use(errorHandler);
   return app;
 }
@@ -747,5 +748,45 @@ describe.sequential("agent cross-tenant route authorization", () => {
     expect(res.status).toBe(409);
     expect(res.body.error).toBe("Only agents in error status can have their error cleared");
     expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+});
+
+
+describe.sequential("board task execution lease authorization", () => {
+  beforeEach(resetMockDefaults);
+  const body = {issueId:keyId,idempotencyKey:"synthetic-bounded-task",headSha:"a".repeat(40),expectedControlHash:"b".repeat(64),expectedModel:"existing-model",scopeDescription:"Review "+"a".repeat(40),profile:{adapterConfig:{command:"/synthetic/codex",extraArgs:[]}},expiresAt:"2030-01-01T00:20:00.000Z"};
+  const board = {type:"board",userId:"synthetic-board",companyIds:[companyId],source:"session"};
+  const path = `/api/agents/${agentId}/task-execution-lease`;
+  const task = {id:keyId,companyId,projectId:null,parentId:null,assigneeAgentId:null,assigneeUserId:null,status:"backlog"};
+  function dbWithTask(row:typeof task|null=task) {return {select:()=>({from:()=>({where:async()=>row?[row]:[]})})};}
+  function permitExcept(denied:string|null) {
+    mockAccessService.decide.mockImplementation(async ({action}:{action:string})=>({allowed:action!==denied,action,reason:action===denied?"deny_missing_grant":"allow_explicit_grant",explanation:"Synthetic permission check"}));
+  }
+  it("rejects agent actors without invoking a lease",async()=>{
+    const app=await createApp({type:"agent",agentId,companyId,companyIds:[companyId]});
+    const response=await requestApp(app,url=>request(url).post(path).send(body));
+    expect(response.status).toBe(403);expect(mockHeartbeatService.invokeTaskExecutionLease).not.toHaveBeenCalled();
+  });
+  it("hides cross-company agents before creating a receipt",async()=>{
+    const app=await createApp({...board,companyIds:[]});
+    const response=await requestApp(app,url=>request(url).post(path).send(body));
+    expect(response.status).toBe(404);expect(mockHeartbeatService.invokeTaskExecutionLease).not.toHaveBeenCalled();
+  });
+  it.each(["agent:wake","agents:create","issue:mutate"])("preserves the %s permission boundary",async denied=>{
+    permitExcept(denied);const app=await createApp(board,dbWithTask());
+    const response=await requestApp(app,url=>request(url).post(path).send(body));
+    expect(response.status).toBe(403);expect(mockHeartbeatService.invokeTaskExecutionLease).not.toHaveBeenCalled();
+  });
+  it("requires a same-company task before lease admission",async()=>{
+    permitExcept(null);const app=await createApp(board,dbWithTask(null));
+    const response=await requestApp(app,url=>request(url).post(path).send(body));
+    expect(response.status).toBe(404);expect(mockHeartbeatService.invokeTaskExecutionLease).not.toHaveBeenCalled();
+  });
+  it("passes the exact validated request only after all existing permissions allow",async()=>{
+    permitExcept(null);mockHeartbeatService.invokeTaskExecutionLease.mockResolvedValue({id:"synthetic-run",status:"queued"});
+    const app=await createApp(board,dbWithTask());
+    const response=await requestApp(app,url=>request(url).post(path).send(body));
+    expect(response.status).toBe(202);expect(mockHeartbeatService.invokeTaskExecutionLease).toHaveBeenCalledExactlyOnceWith(agentId,board.userId,body);
+    expect(mockAccessService.decide.mock.calls.map(([input])=>input.action)).toEqual(["agent:wake","agents:create","issue:mutate"]);
   });
 });

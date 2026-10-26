@@ -219,29 +219,22 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
     expect(finished?.status).toBe("succeeded");
   }, 20_000);
 
-  // Wraps db.transaction so the callback's tx object throws the moment code
-  // calls tx.update(table) for a table named in tablesByCall — this makes a
-  // real Postgres transaction roll back exactly like a genuine write failure
-  // partway through, without touching any other table's update path.
-  // tablesByCall maps a 0-based db.transaction() call index (in call order)
-  // to the table that call should fail on; a call index with no entry runs
-  // every update for real. For example { 1: issues } lets the atomic stale-run
-  // validation transaction complete, then fails only the issue-lock write
-  // inside releaseRunClaimedJustBeforeSuppression's transaction.
-  function withFailingTransactionalUpdate(realDb: typeof db, tablesByCall: Record<number, unknown>) {
-    let callIndex = 0;
+  // Inject one real transactional write failure only after task-drain starts.
+  // Bind the fault to the release stage, not the number of preceding database
+  // transactions: admission may add locks without changing this behavior.
+  function withFailingDrainReleaseUpdate(realDb: typeof db) {
+    let failed = false;
     return new Proxy(realDb, {
       get(target, prop, receiver) {
         if (prop !== "transaction") return Reflect.get(target, prop, receiver);
         return (fn: (tx: unknown) => Promise<unknown>) => {
-          const failingTable = tablesByCall[callIndex];
-          callIndex += 1;
           return target.transaction((tx) => {
             const txProxy = new Proxy(tx as object, {
               get(txTarget, txProp, txReceiver) {
                 if (txProp === "update") {
                   return (table: unknown) => {
-                    if (failingTable !== undefined && table === failingTable) {
+                    if (!failed && table === issues && getTaskDrainStatus().draining) {
+                      failed = true;
                       throw new Error("simulated transactional write failure");
                     }
                     return (txTarget as any).update(table);
@@ -262,7 +255,7 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
     // Fault the release transaction on the issue-lock write, so executeRun's
     // suppression branch catches the failure, logs it, and returns instead
     // of throwing. There is no in-process fallback or retry for this path.
-    const failingDb = withFailingTransactionalUpdate(db, { 1: issues });
+    const failingDb = withFailingDrainReleaseUpdate(db);
     const heartbeat = heartbeatService(failingDb);
 
     const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {

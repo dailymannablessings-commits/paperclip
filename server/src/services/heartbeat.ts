@@ -19722,6 +19722,14 @@ export function heartbeatService(
     if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
 
+    // Restart may reattach the already existing provider process. A lease never
+    // grants another provider attempt, even if native recovery reuses its run ID.
+    if (hasTaskExecutionLease(run) && runOptions.nativeLeaseOwner &&
+        runOptions.nativeRestartRecovery?.kind !== "reattach_existing_runner") {
+      await cancelRunInternal(run.id, "Single-use task execution lease cannot restart a provider attempt");
+      return;
+    }
+
     if (run.status === "queued") {
       const claimed = await claimQueuedRun(run);
       if (!claimed) {

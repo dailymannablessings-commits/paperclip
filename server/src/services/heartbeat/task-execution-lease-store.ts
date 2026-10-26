@@ -10,6 +10,7 @@ type Run=typeof heartbeatRuns.$inferSelect;
 function object(value:unknown):Record<string,unknown>{return value!==null&&typeof value==='object'&&!Array.isArray(value)?value as Record<string,unknown>:{};}
 function controls(agent:typeof agents.$inferSelect):PausedExecutionAgent{return {
  id:agent.id,companyId:agent.companyId,status:agent.status,adapterType:agent.adapterType,
+ role:agent.role,capabilities:agent.capabilities,pauseReason:agent.pauseReason,pausedAt:agent.pausedAt,
  adapterConfig:object(agent.adapterConfig),runtimeConfig:object(agent.runtimeConfig),budgetMonthlyCents:agent.budgetMonthlyCents,
  reportsTo:agent.reportsTo,permissions:object(agent.permissions),
 };}
@@ -18,10 +19,18 @@ export async function validTaskExecutionLease(db:Db,run:Run,now=new Date()):Prom
  try{
   if(!hasTaskExecutionLease(run)||!run.wakeupRequestId||run.retryOfRunId)return false;
   const lease=taskLeaseFromContext(run.contextSnapshot);if(!lease)return false;
+  // Callers may hold a pre-terminalization snapshot (PRP requests and provider
+  // startup both cross awaits). A copied receipt is not the canonical run.
+  const [currentRun]=await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,run.id),eq(heartbeatRuns.companyId,run.companyId),eq(heartbeatRuns.agentId,run.agentId)));
+  if(!currentRun || !['queued','running'].includes(currentRun.status) || currentRun.retryOfRunId ||
+   currentRun.processLossRetryCount!==0 || currentRun.scheduledRetryAttempt!==0 || currentRun.continuationAttempt!==0 || currentRun.scheduledRetryReason!==null ||
+   currentRun.wakeupRequestId!==run.wakeupRequestId || currentRun.invocationSource!=='on_demand' ||
+   currentRun.triggerDetail!=='manual' || currentRun.responsibleUserId!==lease.actorUserId ||
+   canonicalHash(taskLeaseFromContext(currentRun.contextSnapshot))!==canonicalHash(lease))return false;
   const [agent]=await db.select().from(agents).where(and(eq(agents.id,run.agentId),eq(agents.companyId,run.companyId)));
   const [issue]=await db.select().from(issues).where(and(eq(issues.id,lease.issueId),eq(issues.companyId,run.companyId)));
   const [wake]=await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.id,run.wakeupRequestId),eq(agentWakeupRequests.companyId,run.companyId),eq(agentWakeupRequests.agentId,run.agentId),eq(agentWakeupRequests.runId,run.id)));
-  if(!agent||!issue||!wake||wake.reason!=='bounded_task_execution'||run.invocationSource!=='on_demand'||run.triggerDetail!=='manual')return false;
+  if(!agent||!issue||!wake||wake.reason!=='bounded_task_execution'||!['queued','claimed'].includes(wake.status)||wake.finishedAt!==null||wake.source!=='on_demand'||wake.triggerDetail!=='manual'||run.invocationSource!=='on_demand'||run.triggerDetail!=='manual')return false;
   const otherwise=await evaluateAgentInvokabilityFromDb(db,agent.status==='paused'?{...agent,status:'idle'}:agent);
   return verifyPausedTaskExecution({lease,canonicalLease:object(wake.payload)[PAUSED_TASK_LEASE_KEY],agent:controls(agent),issue,
    runId:run.id,wakeId:wake.id,now,canonicalActorType:wake.requestedByActorType,canonicalActorId:wake.requestedByActorId,otherwiseEligible:otherwise.invokable});

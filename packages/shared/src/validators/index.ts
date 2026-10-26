@@ -363,6 +363,8 @@ export {
   createAgentKeySchema,
   agentMineInboxQuerySchema,
   wakeAgentSchema,
+  taskExecutionLeaseSchema,
+  type TaskExecutionLeaseRequest,
   resetAgentSessionSchema,
   testAdapterEnvironmentSchema,
   agentPermissionsSchema,
