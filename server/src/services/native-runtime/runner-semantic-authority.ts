@@ -1,3 +1,4 @@
+import {validTaskExecutionLease,hasTaskExecutionLease} from "../heartbeat/task-execution-lease-store.js";
 import { and, desc, eq, isNull } from "drizzle-orm";
 
 import type { Db } from "@paperclipai/db";
@@ -110,7 +111,7 @@ export class PaperclipRunnerSemanticAuthority {
       operationId,
       execute: async (invocation) => {
         const context = await this.#loadBoundContext();
-        this.#assertActiveContext(context, true);
+        await this.#assertActiveContext(context, true);
         const input = invocation.input;
         switch (operationId) {
           case "get_task_context":
@@ -281,14 +282,14 @@ export class PaperclipRunnerSemanticAuthority {
       throw new Error("paperclip_runner_semantic_run_mismatch");
     }
     const context = await this.#loadBoundContext();
-    this.#assertActiveContext(context, false);
+    await this.#assertActiveContext(context, false);
     return {
       runId: context.run.id,
       companyId: context.run.companyId,
       actor: {
         id: context.agent.id,
         companyId: context.agent.companyId,
-        status: activeAgentStatus(context.agent.status),
+        status: context.agent.status==="paused" && await validTaskExecutionLease(this.#db,context.run) ? "active" : activeAgentStatus(context.agent.status),
         role: context.agent.role,
         claims: [],
       },
@@ -337,10 +338,13 @@ export class PaperclipRunnerSemanticAuthority {
     return row;
   }
 
-  #assertActiveContext(context: BoundContext, requireOwnership: boolean): void {
+  async #assertActiveContext(context: BoundContext, requireOwnership: boolean): Promise<void> {
+    const leased=hasTaskExecutionLease(context.run);
+    const validLease=leased && await validTaskExecutionLease(this.#db,context.run);
     if (
       !["queued", "running"].includes(context.run.status) ||
-      activeAgentStatus(context.agent.status) !== "active" ||
+      (leased && !validLease) ||
+      (activeAgentStatus(context.agent.status) !== "active" && !(context.agent.status==="paused" && validLease)) ||
       (requireOwnership &&
         (context.issue.assigneeAgentId !== this.#binding.agentId ||
           context.issue.executionRunId !== this.#binding.runId))

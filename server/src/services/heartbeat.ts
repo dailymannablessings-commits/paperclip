@@ -1,3 +1,5 @@
+import {createTaskExecutionLease,canonicalTaskExecutionLease,hasTaskExecutionLease,validTaskExecutionLease,releaseTaskExecutionLease,stripTaskExecutionLease} from "./heartbeat/task-execution-lease-store.js";
+import {PAUSED_TASK_LEASE_KEY,type PausedExecutionRequest,type PausedTaskLease} from "./heartbeat/paused-task-execution.js";
 import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
@@ -13869,6 +13871,7 @@ export function heartbeatService(
     agent: typeof agents.$inferSelect,
     issueId: string,
   ) {
+    if (hasTaskExecutionLease(run)) return null;
     const invokability = await getAgentInvokability(agent);
     if (!invokability.invokable) {
       await appendRunEvent(run, {
@@ -15108,6 +15111,7 @@ export function heartbeatService(
       delayMs?: number;
     },
   ) {
+    if (hasTaskExecutionLease(run)) return {outcome:"not_scheduled" as const,reason:"Single-use task execution lease has no automatic retry",errorCode:"bounded_task_lease_no_retry" as const,issueId:readNonEmptyString(run.contextSnapshot?.issueId)};
     const now = opts?.now ?? new Date();
     const retryReason =
       opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
@@ -16843,6 +16847,7 @@ export function heartbeatService(
     try {
       const attempt = () => db.transaction(async (tx) => {
         terminal = null;
+        await tx.select({id:agents.id}).from(agents).where(and(eq(agents.id,run.agentId),eq(agents.companyId,run.companyId))).for("update");
         // Same queue-edit lock order, then the close committer's conversation
         // row. NOWAIT releases partial locks on contention. Claim defers to the
         // queue; dispatch retries this transaction before considering failure.
@@ -17041,6 +17046,15 @@ export function heartbeatService(
     }
   }
 
+  async function queuedClaimSlotAvailable(tx:Db,run:typeof heartbeatRuns.$inferSelect){
+    const [current]=await tx.select().from(agents).where(and(eq(agents.id,run.agentId),eq(agents.companyId,run.companyId))).for("update");
+    if(!current)return false;
+    const [count]=await tx.select({total:sql<number>`count(*)::int`}).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId,run.companyId),eq(heartbeatRuns.agentId,run.agentId),eq(heartbeatRuns.status,"running"),ne(heartbeatRuns.id,run.id)));
+    const running=Number(count?.total??0);
+    if(running>=parseHeartbeatPolicy(current).maxConcurrentRuns)return false;
+    if(hasTaskExecutionLease(run))return running===0 && await validTaskExecutionLease(tx,run);
+    return (await evaluateAgentInvokabilityFromDb(tx,current)).invokable;
+  }
   async function claimQueuedRun(
     run: typeof heartbeatRuns.$inferSelect,
     companyAgents?: AgentOrgRow[],
@@ -17054,13 +17068,15 @@ export function heartbeatService(
       );
       return null;
     }
-    const invokability = companyAgents
-      ? evaluateAgentInvokability(toAgentOrgRow(agent), companyAgents)
-      : await getAgentInvokability(agent);
-    if (!invokability.invokable) {
+    const leased = hasTaskExecutionLease(run);
+    const validLease = leased && await validTaskExecutionLease(db,run);
+    const invokability = validLease
+      ? await getAgentInvokability(agent.status === "paused" ? {...agent,status:"idle"} : agent)
+      : companyAgents ? evaluateAgentInvokability(toAgentOrgRow(agent), companyAgents) : await getAgentInvokability(agent);
+    if ((leased && !validLease) || !invokability.invokable) {
       await cancelRunInternal(
         run.id,
-        `Cancelled because the agent is not invokable: ${invokability.reason}`,
+        "Cancelled because task execution authority is unavailable",
       );
       return null;
     }
@@ -17207,6 +17223,7 @@ export function heartbeatService(
       issueId && run.wakeupRequestId && queuedCommentIds.length > 0
         ? await db
             .transaction(async (tx) => {
+              if(!await queuedClaimSlotAvailable(tx as unknown as Db,run))return {kind:"stale" as const,run:null};
               // Match the queue-edit lock order: issue, wake, then run. Once the
               // run becomes running, a concurrent discard must observe the
               // claimed wake and return an explicit conflict; if discard wins,
@@ -17519,8 +17536,10 @@ export function heartbeatService(
     }
     const claimed = queuedCommentClaim
       ? queuedCommentClaim.run
-      : await withChatControlRecoveryGate(run, "claim", async (tx) =>
-          tx
+      : await withChatControlRecoveryGate(run, "claim", async (client) => client.transaction(async raw=>{
+          const tx=raw as unknown as Db;
+          if(!await queuedClaimSlotAvailable(tx,run))return null;
+          return tx
             .update(heartbeatRuns)
             .set({
               status: "running",
@@ -17537,8 +17556,8 @@ export function heartbeatService(
               ),
             )
             .returning()
-            .then((rows) => rows[0] ?? null),
-        );
+            .then((rows) => rows[0] ?? null);
+        }));
     if (!claimed) return null;
 
     publishLiveEvent({
@@ -18492,6 +18511,8 @@ export function heartbeatService(
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+    const expiredTaskLeases=await db.select().from(heartbeatRuns).where(and(inArray(heartbeatRuns.status,["queued","running","scheduled_retry"]),sql`${heartbeatRuns.contextSnapshot}->${PAUSED_TASK_LEASE_KEY} is not null`,sql`${heartbeatRuns.contextSnapshot}->${PAUSED_TASK_LEASE_KEY}->>'expiresAt' <= ${new Date().toISOString()}`)).limit(50);
+    for(const expired of expiredTaskLeases) if(await canonicalTaskExecutionLease(db,expired)) await cancelRunInternal(expired.id,"Bounded task execution lease expired");
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
 
@@ -19422,6 +19443,24 @@ export function heartbeatService(
     }
   }
 
+  async function dispatchTaskExecutionLeaseUnlocked(run:typeof heartbeatRuns.$inferSelect) {
+    if(run.status!=="queued" || !await validTaskExecutionLease(db,run))return [];
+    const agent=await getAgent(run.agentId);if(!agent)return [];
+    if(await countRunningRunsForAgent(agent.id)>0 || parseHeartbeatPolicy(agent).maxConcurrentRuns<=0)return [];
+    const claimed=await claimQueuedRun(run);if(!claimed)return [];
+    const execution=executeRun(claimed.id).catch(()=>logger.error({runId:claimed.id},"Bounded task execution failed"));
+    activeRunExecutionPromises.add(execution);void execution.finally(()=>activeRunExecutionPromises.delete(execution));
+    return [claimed];
+  }
+  async function invokeTaskExecutionLease(agentId:string,actorUserId:string,request:PausedExecutionRequest){
+    if((await getSchedulingSuppression()).suppressed)throw conflict("Execution scheduling is suppressed");
+    const agent=await getAgent(agentId);if(!agent)throw conflict("Agent no longer exists");
+    return withAgentStartLock(agentId,async()=>{
+      const run=await createTaskExecutionLease(db,{agentId,companyId:agent.companyId,actorUserId,request});
+      await dispatchTaskExecutionLeaseUnlocked((await getRun(run.id))!);
+      return (await getRun(run.id))!;
+    });
+  }
   async function startNextQueuedRunForAgent(agentId: string) {
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
@@ -19431,6 +19470,11 @@ export function heartbeatService(
       if (!agent) return [];
       const invokability = await getAgentInvokability(agent);
       if (!invokability.invokable) {
+        if(agent.status==="paused" && invokability.reason==="paused"){
+          const leasedRows=await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.agentId,agentId),eq(heartbeatRuns.companyId,agent.companyId),eq(heartbeatRuns.status,"queued"),sql`${heartbeatRuns.contextSnapshot}->${PAUSED_TASK_LEASE_KEY} is not null`)).orderBy(asc(heartbeatRuns.createdAt));
+          for(const candidate of leasedRows){const claimed=await dispatchTaskExecutionLeaseUnlocked(candidate);if(claimed.length)return claimed;}
+          return [];
+        }
         if (shouldCancelRunsForNonInvokableAgent(invokability)) {
           await cancelActiveForAgentInternal(
             agentId,
@@ -19797,6 +19841,7 @@ export function heartbeatService(
             "keep_running" | "stop_and_reuse" | "destroy_after_turn";
         }
       | undefined;
+    let taskLeaseExpiryTimer: ReturnType<typeof setTimeout> | undefined;
     let managedAiRuntime: Awaited<ReturnType<typeof prepareManagedAiRuntime>> | undefined;
     let providerTraceCapture: Awaited<
       ReturnType<typeof traceStore.prepare>
@@ -19820,6 +19865,16 @@ export function heartbeatService(
         return;
       }
 
+      if(hasTaskExecutionLease(run)){
+        if(!await validTaskExecutionLease(db,run)){
+          await setRunStatus(run.id,"cancelled",{finishedAt:new Date(),error:"Bounded task execution authority changed before preparation",errorCode:"bounded_task_lease_invalid"});
+          await setWakeupStatus(run.wakeupRequestId,"cancelled",{finishedAt:new Date()});
+          await releaseIssueExecutionAndPromote((await getRun(run.id))!);return;
+        }
+        const lease=run.contextSnapshot![PAUSED_TASK_LEASE_KEY] as PausedTaskLease;
+        taskLeaseExpiryTimer=setTimeout(()=>{void cancelRunInternal(run.id,"Bounded task execution lease expired").catch(()=>logger.warn({runId:run.id},"Bounded task expiry settlement pending"));},Math.max(1,Date.parse(lease.expiresAt)-Date.now()));
+        taskLeaseExpiryTimer.unref();
+      }
       // The claimed adapter identity is immutable recovery evidence. Do not
       // execute a newly selected adapter under a previous adapter's claim.
       const selectedAdapter = claimedAdapterType(run);
@@ -22346,7 +22401,17 @@ export function heartbeatService(
 
         // Pause Durability: flip to "running" ONLY if the agent is still invokable.
         // Atomic conditional UPDATE is the sole gate (no read-then-write); 0 rows => abort.
-        const runningAgent = await db
+        const runningAgent = hasTaskExecutionLease(run) ? await db.transaction(async raw=>{
+          const tx=raw as unknown as Db;
+          const [currentAgent]=await tx.select().from(agents).where(and(eq(agents.id,agent.id),eq(agents.companyId,run.companyId))).for("update");
+          const lease=await canonicalTaskExecutionLease(tx,run);if(!lease||!currentAgent)return null;
+          await tx.select({id:issues.id}).from(issues).where(and(eq(issues.id,lease.issueId),eq(issues.companyId,run.companyId))).for("update");
+          await tx.select({id:agentWakeupRequests.id}).from(agentWakeupRequests).where(and(eq(agentWakeupRequests.id,lease.id),eq(agentWakeupRequests.companyId,run.companyId))).for("update");
+          if(!await validTaskExecutionLease(tx,run))return null;
+          if(lease.originalStatus==="paused")return currentAgent;
+          const [updated]=await tx.update(agents).set({status:"running",updatedAt:new Date()}).where(and(eq(agents.id,agent.id),notInArray(agents.status,[...DIRECT_NON_INVOKABLE_STATUSES]))).returning();
+          return updated??null;
+        }) : await db
           .update(agents)
           .set({ status: "running", updatedAt: new Date() })
           .where(
@@ -25470,6 +25535,7 @@ export function heartbeatService(
         }
       }
     } finally {
+      if(taskLeaseExpiryTimer)clearTimeout(taskLeaseExpiryTimer);
       if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);
       try {
@@ -25650,7 +25716,7 @@ export function heartbeatService(
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
-      if (latestRun?.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(latestRun.status)) {
+      if (!hasTaskExecutionLease(run) && latestRun?.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(latestRun.status)) {
         const [pending] = await db.select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
           eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
           eq(agentWakeupRequests.status, "deferred_issue_execution"),
@@ -25665,7 +25731,7 @@ export function heartbeatService(
       if (
         !nativeSessionResumeScheduled &&
         !nativeWorkspaceFinalizeScheduled &&
-        !shutdownInProgress
+        !shutdownInProgress && !hasTaskExecutionLease(run)
       ) {
         if (latestRun) await resumeRemoteStopComments(latestRun).catch(err => {
           logger.warn({ err, runId: run.id }, "failed to resume user messages after remote Stop");
@@ -25679,6 +25745,8 @@ export function heartbeatService(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
     options: { suppressImmediateRecovery?: boolean } = {},
   ) {
+    const leasedRun=await getRun(run.id);
+    if(leasedRun && hasTaskExecutionLease(leasedRun)){await releaseTaskExecutionLease(db,leasedRun);return;}
     try {
       const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
         companyId: run.companyId,
@@ -25708,6 +25776,7 @@ export function heartbeatService(
     };
     const reason = opts.reason ?? null;
     let payload = opts.payload ? { ...opts.payload } : null;
+    stripTaskExecutionLease(contextSnapshot,payload);
     // Only the board queue route can record interruption authority on an
     // existing receipt. Never accept this internal marker from a wake caller.
     if (payload) {
@@ -25913,6 +25982,13 @@ export function heartbeatService(
       await db.insert(agentWakeupRequests).values(request);
       return { created: true };
     };
+    const parentIds=[opts.failedRunId,readNonEmptyString(enrichedContextSnapshot.retryOfRunId),readNonEmptyString(payload?.retryOfRunId),...(opts.requestedByActorType!=="user"?[readNonEmptyString(enrichedContextSnapshot.sourceRunId),readNonEmptyString(payload?.sourceRunId)]:[])].filter((id):id is string=>typeof id==="string"&&isUuidLike(id));
+    for(const parentId of new Set(parentIds)){
+      const parent=await getRun(parentId);
+      if(parent && parent.companyId===agent.companyId && parent.agentId===agentId && await canonicalTaskExecutionLease(db,parent)){
+        await writeSkippedRequest("bounded_task_lease_no_retry",{error:"Single-use bounded task execution requires a new explicit task lease"});return null;
+      }
+    }
     const writeSkippedHeartbeatRequest = async (
       skipReason: string,
       details: Record<string, unknown>,
@@ -29024,6 +29100,7 @@ export function heartbeatService(
       }),
 
     wakeup: trackWakeup,
+    invokeTaskExecutionLease,
     dispatchPendingNativeStatusWakeups,
     triggerIssueMonitor,
 

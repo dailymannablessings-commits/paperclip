@@ -1,3 +1,4 @@
+import {validTaskExecutionLease,hasTaskExecutionLease} from "../heartbeat/task-execution-lease-store.js";
 import { resolve } from "node:path";
 
 import { and, eq } from "drizzle-orm";
@@ -205,8 +206,10 @@ export function runnerPrpCoordinator(
           ),
         )
         .limit(1);
+      const leased=binding && hasTaskExecutionLease(binding.run);
+      const validLease=!!binding && !!leased && await validTaskExecutionLease(db,binding.run);
       if (
-        !binding ||
+        !binding || (leased && !validLease) ||
         !["queued", "running"].includes(binding.run.status) ||
         binding.run.driverKind !== "codex" ||
         !binding.run.completionContractId ||
@@ -215,9 +218,7 @@ export function runnerPrpCoordinator(
           binding.run.completionContractSha256 ||
         binding.issue.assigneeAgentId !== input.agentId ||
         binding.issue.executionRunId !== input.runId ||
-        ["paused", "terminated", "pending_approval", "error"].includes(
-          binding.agent.status,
-        )
+        (["paused", "terminated", "pending_approval", "error"].includes(binding.agent.status) && !(binding.agent.status==="paused" && validLease))
       ) {
         throw new Error("runner_prp_run_not_authorized");
       }

@@ -1,3 +1,4 @@
+import {taskExecutionLeaseSchema} from "../services/heartbeat/task-execution-lease-schema.js";
 import { listOpenRouterModels } from "../services/openrouter-models.js";
 import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings } from "../services/ai-connection-runtime.js";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, aiConnectionBindingSchema, type AiConnectionBinding } from "@paperclipai/shared";
@@ -5886,6 +5887,15 @@ export function agentRoutes(
 
     res.status(202).json(run);
   };
+
+  router.post("/agents/:id/task-execution-lease",validate(taskExecutionLeaseSchema),async(req,res)=>{
+    assertBoard(req);
+    const agent=await getAccessibleResource(req,res,svc.getById(req.params.id as string),"Agent not found");if(!agent)return;
+    await assertBoardCanWakeAgent(req,agent);
+    if(!req.actor.userId)throw forbidden("Board user context required");
+    const run=await heartbeat.invokeTaskExecutionLease(agent.id,req.actor.userId,req.body);
+    res.status(202).json(run);
+  });
 
   router.post("/agents/:id/wakeup", validate(wakeAgentSchema), async (req, res) => {
     await handleWakeupRoute(req, res, {
