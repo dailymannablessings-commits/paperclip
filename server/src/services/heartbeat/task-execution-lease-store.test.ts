@@ -9,7 +9,7 @@ import {heartbeatService} from '../heartbeat.js';
 import {PaperclipRunnerSemanticAuthority} from '../native-runtime/runner-semantic-authority.js';
 import {beforeAll,afterAll,describe,it,expect} from 'vitest';
 import {eq,and,sql} from 'drizzle-orm';
-import {createDb,startEmbeddedPostgresTestDatabase,agents,companies,issues,agentWakeupRequests,heartbeatRuns,activityLog,completionContracts} from '@paperclipai/db';
+import {createDb,startEmbeddedPostgresTestDatabase,agents,companies,issues,agentWakeupRequests,heartbeatRuns,activityLog,completionContracts,nativeRunFinalizations} from '@paperclipai/db';
 import {createTaskExecutionLease,validTaskExecutionLease,releaseTaskExecutionLease,stripTaskExecutionLease} from './task-execution-lease-store.js';
 import {executionControlHash,PAUSED_TASK_LEASE_KEY} from './paused-task-execution.js';
 
@@ -181,6 +181,22 @@ describe('task execution lease PostgreSQL admission',()=>{
   const f=await fixture();const run=await createTaskExecutionLease(db,f);
   await db.update(agents).set(change).where(eq(agents.id,f.agentId));
   expect(await validTaskExecutionLease(db,run)).toBe(false);
+ });
+ it('actual native retry dispatcher cannot open a replacement provider under the same leased run',async()=>{
+  const f=await fixture('idle');const run=await createTaskExecutionLease(db,f);
+  await db.update(heartbeatRuns).set({status:'running',runtimeMode:'native',nativeIssueId:f.request.issueId,nativePhase:'observed',runnerProfileJson:{nativeExecutionInput:{syntheticEnvelope:true},sessionCheckpoint:{providerSessionId:'synthetic-existing-provider'}},controllerLeaseExpiresAt:new Date(Date.now()+60_000)}).where(eq(heartbeatRuns.id,run.id));
+  await db.update(issues).set({executionRunId:run.id}).where(eq(issues.id,f.request.issueId));
+  await db.insert(nativeRunFinalizations).values({runId:run.id,companyId:f.companyId,issueId:f.request.issueId,phase:'retryable_failure',attempt:1,nextAttemptAt:new Date(Date.now()-1000)});
+  let providerStarts=0;
+  const service=heartbeatService(db,{runtimeEnv:{},nativeSessionBackendFactory:()=>{providerStarts++;throw Error('Replacement provider must not start')}});
+  try{
+   await service.reapOrphanedRuns();await service.drainActiveRunExecutions();
+   const terminal=await service.getRun(run.id);
+   expect(providerStarts).toBe(0);
+   const [agent]=await db.select().from(agents).where(eq(agents.id,f.agentId));expect(agent.status).toBe('idle');
+   expect(terminal).toMatchObject({status:'cancelled',error:'Single-use task execution lease cannot restart a provider attempt'});
+   expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId,f.agentId))).toHaveLength(1);
+  }finally{await service.drainActiveRunExecutions()}
  });
  it('ordinary wake context/payload cannot smuggle a lease',()=>{const context={[PAUSED_TASK_LEASE_KEY]:{forged:true},issueId:'preserved'};const payload={[PAUSED_TASK_LEASE_KEY]:{forged:true},commentId:'preserved'};stripTaskExecutionLease(context,payload);expect(context).toEqual({issueId:'preserved'});expect(payload).toEqual({commentId:'preserved'})});
 });
