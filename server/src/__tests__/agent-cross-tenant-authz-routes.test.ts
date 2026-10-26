@@ -789,4 +789,49 @@ describe.sequential("board task execution lease authorization", () => {
     expect(response.status).toBe(202);expect(mockHeartbeatService.invokeTaskExecutionLease).toHaveBeenCalledExactlyOnceWith(agentId,board.userId,body);
     expect(mockAccessService.decide.mock.calls.map(([input])=>input.action)).toEqual(["agent:wake","agents:create","issue:mutate"]);
   });
+  it("returns a raw-control seal for redacted role configuration without exposing it or creating work",async()=>{
+    permitExcept(null);
+    const rawAgent={...baseAgent,adapterType:"codex_local",adapterConfig:{model:"inherited-model",env:{CODEX_HOME:"synthetic-private-home"}}};
+    mockAgentService.getById.mockResolvedValue(rawAgent);
+    const app=await createApp(board);
+    const response=await requestApp(app,url=>request(url).get(`${path}/controls`));
+    expect(response.status).toBe(200);
+    const {executionControlHash}=await import("../services/heartbeat/paused-task-execution.js");
+    const {redactAgentAdapterConfig}=await import("../redaction.js");
+    const controls={id:rawAgent.id,companyId:rawAgent.companyId,status:rawAgent.status,adapterType:rawAgent.adapterType,role:rawAgent.role,capabilities:rawAgent.capabilities,pauseReason:rawAgent.pauseReason,pausedAt:rawAgent.pausedAt,adapterConfig:rawAgent.adapterConfig,runtimeConfig:rawAgent.runtimeConfig,budgetMonthlyCents:rawAgent.budgetMonthlyCents,reportsTo:rawAgent.reportsTo,permissions:rawAgent.permissions};
+    expect(response.body).toEqual({agentId,companyId,status:"idle",expectedModel:"inherited-model",expectedControlHash:executionControlHash(controls)});
+    expect(response.body.expectedControlHash).not.toBe(executionControlHash({...controls,adapterConfig:redactAgentAdapterConfig(rawAgent.adapterConfig)}));
+    expect(response.headers["cache-control"]).toBe("no-store");
+    expect(JSON.stringify(response.body)).not.toContain("synthetic-private-home");
+    expect(JSON.stringify(response.body)).not.toContain("adapterConfig");
+    expect(mockHeartbeatService.invokeTaskExecutionLease).not.toHaveBeenCalled();
+    expect(mockAccessService.decide.mock.calls.map(([input])=>input.action)).toEqual(["agent:wake","agents:create"]);
+  });
+  it.each(["agent:wake","agents:create"])("protects control seals with the existing %s permission",async denied=>{
+    permitExcept(denied);const app=await createApp(board);
+    const response=await requestApp(app,url=>request(url).get(`${path}/controls`));
+    expect(response.status).toBe(403);expect(mockHeartbeatService.invokeTaskExecutionLease).not.toHaveBeenCalled();
+  });
+  it("rejects agent actors from control seals",async()=>{
+    const app=await createApp({type:"agent",agentId,companyId,companyIds:[companyId]});
+    const response=await requestApp(app,url=>request(url).get(`${path}/controls`));
+    expect(response.status).toBe(403);
+  });
+  it("hides cross-company control seals",async()=>{
+    const app=await createApp({...board,companyIds:[]});
+    const response=await requestApp(app,url=>request(url).get(`${path}/controls`));
+    expect(response.status).toBe(404);
+  });
+  it("changes the seal when a hidden environment binding changes",async()=>{
+    permitExcept(null);const app=await createApp(board);
+    mockAgentService.getById.mockResolvedValue({...baseAgent,adapterConfig:{model:"inherited-model",env:{CODEX_HOME:"synthetic-first-home"}}});
+    const first=await requestApp(app,url=>request(url).get(`${path}/controls`));
+    mockAgentService.getById.mockResolvedValue({...baseAgent,adapterConfig:{model:"inherited-model",env:{CODEX_HOME:"synthetic-second-home"}}});
+    const second=await requestApp(app,url=>request(url).get(`${path}/controls`));
+    expect(first.status).toBe(200);expect(second.status).toBe(200);
+    expect(first.body.expectedControlHash).not.toBe(second.body.expectedControlHash);
+    expect(JSON.stringify([first.body,second.body])).not.toContain("synthetic-first-home");
+    expect(JSON.stringify([first.body,second.body])).not.toContain("synthetic-second-home");
+  });
+
 });

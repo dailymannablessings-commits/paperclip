@@ -3404,6 +3404,21 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/agents/{id}/task-execution-lease/controls",
+  tags: ["agents"],
+  summary: "Read a current task-execution control seal",
+  description: "Board-only, nonmutating seal of authoritative agent controls. Requires agent wake and company agent-management permission. Returns no configuration or environment values; task-mutation permission is checked separately when admitting a lease. Clients must use a fresh seal and admission rechecks the controls atomically.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(z.object({ agentId: z.string(), companyId: z.string(), status: z.string(), expectedControlHash: z.string(), expectedModel: z.string().nullable() })),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/agents/{id}/task-execution-lease",
   tags: ["agents"],

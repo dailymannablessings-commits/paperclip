@@ -4,7 +4,7 @@ import type {Db} from '@paperclipai/db';
 import {activityLog,agents,agentWakeupRequests,heartbeatRuns,issues} from '@paperclipai/db';
 import {evaluateAgentInvokabilityFromDb} from '../agent-invokability.js';
 import {conflict} from '../../errors.js';
-import {admitPausedTaskExecution,canonicalHash,PAUSED_TASK_LEASE_KEY,verifyPausedTaskExecution,taskLeaseFromContext,type PausedExecutionAgent,type PausedExecutionRequest,type PausedTaskLease} from './paused-task-execution.js';
+import {admitPausedTaskExecution,canonicalHash,executionControlHash,PAUSED_TASK_LEASE_KEY,verifyPausedTaskExecution,taskLeaseFromContext,type PausedExecutionAgent,type PausedExecutionRequest,type PausedTaskLease} from './paused-task-execution.js';
 
 type Run=typeof heartbeatRuns.$inferSelect;
 function object(value:unknown):Record<string,unknown>{return value!==null&&typeof value==='object'&&!Array.isArray(value)?value as Record<string,unknown>:{};}
@@ -14,6 +14,10 @@ function controls(agent:typeof agents.$inferSelect):PausedExecutionAgent{return 
  adapterConfig:object(agent.adapterConfig),runtimeConfig:object(agent.runtimeConfig),budgetMonthlyCents:agent.budgetMonthlyCents,
  reportsTo:agent.reportsTo,permissions:object(agent.permissions),
 };}
+export function taskExecutionControlSeal(agent:typeof agents.$inferSelect){
+ const authoritative=controls(agent);
+ return {agentId:agent.id,companyId:agent.companyId,status:agent.status,expectedControlHash:executionControlHash(authoritative),expectedModel:typeof authoritative.adapterConfig.model==='string'?authoritative.adapterConfig.model:null};
+}
 export function hasTaskExecutionLease(run:Pick<Run,'contextSnapshot'>):boolean{return Object.hasOwn(object(run.contextSnapshot),PAUSED_TASK_LEASE_KEY);}
 export async function validTaskExecutionLease(db:Db,run:Run,now=new Date()):Promise<boolean>{
  try{
