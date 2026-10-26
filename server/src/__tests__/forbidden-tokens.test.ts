@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 const {
+  readForbiddenTokensFile,
   resolveDynamicForbiddenTokens,
   resolveForbiddenTokens,
   runForbiddenTokenCheck,
@@ -50,28 +51,118 @@ describe("forbidden token check", () => {
     }
   });
 
-  it("reports matches without leaking which token was searched", () => {
-    const exec = vi
-      .fn()
-      .mockReturnValueOnce("server/file.ts:1:found\n")
-      .mockImplementation(() => {
-        throw new Error("not found");
+  it("reports matches without leaking tokens or matched source contents", () => {
+    const spawn = vi.fn().mockReturnValueOnce({status:0,signal:null}).mockReturnValueOnce({status:1,signal:null});
+    const log=vi.fn(),error=vi.fn();
+    expect(runForbiddenTokenCheck({repoRoot:"/repo",tokens:["synthetic-private-token","custom-token"],spawn,log,error})).toBe(1);
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(error).toHaveBeenCalledWith("Build blocked: forbidden tokens were detected in tracked files. Matched contents are withheld.");
+    expect(JSON.stringify([...log.mock.calls,...error.mock.calls])).not.toContain("synthetic-private-token");
+  });
+
+});
+
+import { mkdtempSync, writeFileSync, mkdirSync, existsSync, symlinkSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { execFileSync, spawnSync } from 'node:child_process';
+
+function fixtureRepo(content = 'public fixture\n') {
+  const root = mkdtempSync(join(tmpdir(), 'synthetic-token-scan-'));
+  execFileSync('git', ['init', '-q', root]);
+  writeFileSync(join(root, 'fixture.txt'), content);
+  execFileSync('git', ['add', 'fixture.txt'], { cwd: root });
+  return root;
+}
+function check(repoRoot: string, tokens: string[], overrides = {}) {
+  return runForbiddenTokenCheck({ repoRoot, tokens, log: vi.fn(), error: vi.fn(), ...overrides });
+}
+
+describe('packaging token scan safety regressions', () => {
+  it('blocks a real match set larger than the old execSync buffer', () => {
+    const root = fixtureRepo('synthetic-private-needle\n'.repeat(100_000));
+    try { expect(check(root, ['synthetic-private-needle'])).toBe(1); }
+    finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('does not execute shell substitutions supplied as a token', () => {
+    const token = '$(touch owned-sentinel)';
+    const root = fixtureRepo(token + '\n');
+    try {
+      expect(check(root, [token])).toBe(1);
+      expect(existsSync(join(root, 'owned-sentinel'))).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('matches literal configured tokens rather than regular expressions', () => {
+    const root = fixtureRepo('ab\n');
+    try { expect(check(root, ['a[b]'])).toBe(0); }
+    finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it.each([
+    { status: 2, signal: null, error: undefined },
+    { status: null, signal: 'SIGTERM', error: undefined },
+    { status: null, signal: null, error: Object.assign(new Error('synthetic-private-error'), {code:'ENOBUFS'}) },
+  ])('fails closed on an incomplete scan without printing token or error details %j', result => {
+    const root = fixtureRepo(); const log = vi.fn(), error = vi.fn();
+    try {
+      expect(check(root, ['synthetic-private-needle'], { spawn: () => result, log, error })).toBe(1);
+      expect(JSON.stringify([...log.mock.calls, ...error.mock.calls])).not.toContain('synthetic-private');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('filters only generic dynamic account values, preserving an explicit identical token', () => {
+    const generic = { USER:'user', LOGNAME:'root', USERNAME:'runner' };
+    const osModule = { userInfo: () => ({username:'nobody'}) };
+    expect(resolveDynamicForbiddenTokens(generic, osModule)).toEqual([]);
+    const root = fixtureRepo(); const tokensFile = join(root, 'configured-tokens.txt');
+    writeFileSync(tokensFile, 'user\nrunner\n');
+    try { expect(resolveForbiddenTokens(tokensFile, generic, osModule)).toEqual(['user', 'runner']); }
+    finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it.each(['explicit-private-fixture','user','runner'])('checks explicit %s through the common hook list from an actual linked worktree', token => {
+    const root = fixtureRepo(token+'\n'); const linked = root + '-linked';
+    execFileSync('git', ['-c','user.name=Synthetic Fixture','-c','user.email=fixture@example.invalid','commit','-qm','Synthetic fixture'], {cwd:root});
+    mkdirSync(join(root,'.git','hooks'), {recursive:true});
+    writeFileSync(join(root,'.git','hooks','forbidden-tokens.txt'),token+'\n');
+    execFileSync('git',['worktree','add','-q','-b','fixture-linked',linked],{cwd:root});
+    try {
+      const script = resolve(process.cwd(), 'scripts/check-forbidden-tokens.mjs');
+      const result = spawnSync(process.execPath,[script],{cwd:linked,env:{...process.env,USER:'user',LOGNAME:'user',USERNAME:'user'},encoding:'utf8'});
+      expect(result.status).toBe(1);
+      expect(result.stdout + result.stderr).not.toContain(token);
+    } finally { execFileSync('git',['worktree','remove',linked],{cwd:root});rmSync(root,{recursive:true,force:true}); }
+  });
+});
+
+
+it('blocks an unavailable repository without leaking raw git diagnostics', () => {
+  const root=mkdtempSync(join(tmpdir(),'synthetic-non-repo-'));
+  try {
+    const script=resolve(process.cwd(),'scripts/check-forbidden-tokens.mjs');
+    const result=spawnSync(process.execPath,[script],{cwd:root,encoding:'utf8'});
+    expect(result.status).toBe(1);
+    expect(result.stderr.trim()).toBe('Build blocked: forbidden-token configuration or repository could not be read.');
+  }finally{rmSync(root,{recursive:true,force:true})}
+});
+
+
+describe('forbidden configuration read safety', () => {
+  it.each(['EACCES', 'ENOTDIR', 'EIO'])('propagates %s instead of skipping configured tokens', (code) => {
+    const failure = Object.assign(new Error('private-path'), { code });
+    expect(() => readForbiddenTokensFile('/missing-fixture', { readFile: () => { throw failure; } })).toThrow(failure);
+  });
+  it('allows a genuinely absent optional list', () => {
+    const absent = () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); };
+    expect(readForbiddenTokensFile('/missing-fixture', { readFile: absent, lstat: absent })).toEqual([]);
+  });
+  it('blocks a dangling configured common-hook symlink through the actual CLI', () => {
+    const root = fixtureRepo();
+    try {
+      symlinkSync(join(root, 'missing-token-list'), join(root, '.git/hooks/forbidden-tokens.txt'));
+      const result = spawnSync(process.execPath, [resolve('scripts/check-forbidden-tokens.mjs')], {
+        cwd: root, encoding: 'utf8', env: { ...process.env, USER: 'user', LOGNAME: 'user', USERNAME: 'user' },
       });
-    const log = vi.fn();
-    const error = vi.fn();
-
-    const exitCode = runForbiddenTokenCheck({
-      repoRoot: "/repo",
-      tokens: ["paperclip", "custom-token"],
-      exec,
-      log,
-      error,
-    });
-
-    expect(exitCode).toBe(1);
-    expect(exec).toHaveBeenCalledTimes(2);
-    expect(error).toHaveBeenCalledWith("ERROR: Forbidden tokens found in tracked files:\n");
-    expect(error).toHaveBeenCalledWith("  server/file.ts:1:found");
-    expect(error).toHaveBeenCalledWith("\nBuild blocked. Remove the forbidden token(s) before publishing.");
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('configuration or repository could not be read');
+      expect(result.stderr).not.toContain(root);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
