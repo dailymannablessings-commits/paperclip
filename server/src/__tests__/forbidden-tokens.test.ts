@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 const {
+  readForbiddenTokensFile,
   resolveDynamicForbiddenTokens,
   resolveForbiddenTokens,
   runForbiddenTokenCheck,
@@ -61,7 +62,7 @@ describe("forbidden token check", () => {
 
 });
 
-import { mkdtempSync, writeFileSync, mkdirSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, existsSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -140,4 +141,28 @@ it('blocks an unavailable repository without leaking raw git diagnostics', () =>
     expect(result.status).toBe(1);
     expect(result.stderr.trim()).toBe('Build blocked: forbidden-token configuration or repository could not be read.');
   }finally{rmSync(root,{recursive:true,force:true})}
+});
+
+
+describe('forbidden configuration read safety', () => {
+  it.each(['EACCES', 'ENOTDIR', 'EIO'])('propagates %s instead of skipping configured tokens', (code) => {
+    const failure = Object.assign(new Error('private-path'), { code });
+    expect(() => readForbiddenTokensFile('/missing-fixture', { readFile: () => { throw failure; } })).toThrow(failure);
+  });
+  it('allows a genuinely absent optional list', () => {
+    const absent = () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); };
+    expect(readForbiddenTokensFile('/missing-fixture', { readFile: absent, lstat: absent })).toEqual([]);
+  });
+  it('blocks a dangling configured common-hook symlink through the actual CLI', () => {
+    const root = fixtureRepo();
+    try {
+      symlinkSync(join(root, 'missing-token-list'), join(root, '.git/hooks/forbidden-tokens.txt'));
+      const result = spawnSync(process.execPath, [resolve('scripts/check-forbidden-tokens.mjs')], {
+        cwd: root, encoding: 'utf8', env: { ...process.env, USER: 'user', LOGNAME: 'user', USERNAME: 'user' },
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('configuration or repository could not be read');
+      expect(result.stderr).not.toContain(root);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 });

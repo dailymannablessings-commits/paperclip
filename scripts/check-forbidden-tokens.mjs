@@ -13,7 +13,7 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import os from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,10 +37,24 @@ export function resolveDynamicForbiddenTokens(env = process.env, osModule = os) 
   return uniqueNonEmpty(candidates).filter((name) => !genericAccounts.has(name.toLowerCase()));
 }
 
-export function readForbiddenTokensFile(tokensFile) {
-  if (!existsSync(tokensFile)) return [];
+export function readForbiddenTokensFile(tokensFile, { readFile = readFileSync, lstat = lstatSync } = {}) {
+  let content;
+  try {
+    content = readFile(tokensFile, "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    // ENOENT can also mean an existing configured symlink has a missing target.
+    // Only a genuinely absent optional list may fall back to inferred tokens.
+    try {
+      lstat(tokensFile);
+    } catch (statError) {
+      if (statError?.code === "ENOENT") return [];
+      throw statError;
+    }
+    throw new Error("Configured forbidden-token list could not be read.");
+  }
 
-  return readFileSync(tokensFile, "utf8")
+  return content
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"));
