@@ -759,6 +759,9 @@ describe.sequential("board task execution lease authorization", () => {
   const path = `/api/agents/${agentId}/task-execution-lease`;
   const task = {id:keyId,companyId,projectId:null,parentId:null,assigneeAgentId:null,assigneeUserId:null,status:"backlog"};
   function dbWithTask(row:typeof task|null=task) {return {select:()=>({from:()=>({where:async()=>row?[row]:[]})})};}
+  function dbWithAgent(row: Record<string, unknown> | null | (() => Record<string, unknown> | null)) {
+    return { select: vi.fn(() => ({ from: () => ({ where: async () => { const current = typeof row === "function" ? row() : row; return current ? [current] : []; } }) })) };
+  }
   function permitExcept(denied:string|null) {
     mockAccessService.decide.mockImplementation(async ({action}:{action:string})=>({allowed:action!==denied,action,reason:action===denied?"deny_missing_grant":"allow_explicit_grant",explanation:"Synthetic permission check"}));
   }
@@ -793,7 +796,7 @@ describe.sequential("board task execution lease authorization", () => {
     permitExcept(null);
     const rawAgent={...baseAgent,adapterType:"codex_local",adapterConfig:{model:"inherited-model",env:{CODEX_HOME:"synthetic-private-home"}}};
     mockAgentService.getById.mockResolvedValue(rawAgent);
-    const app=await createApp(board);
+    const app=await createApp(board,dbWithAgent(rawAgent));
     const response=await requestApp(app,url=>request(url).get(`${path}/controls`));
     expect(response.status).toBe(200);
     const {executionControlHash}=await import("../services/heartbeat/paused-task-execution.js");
@@ -823,15 +826,65 @@ describe.sequential("board task execution lease authorization", () => {
     expect(response.status).toBe(404);
   });
   it("changes the seal when a hidden environment binding changes",async()=>{
-    permitExcept(null);const app=await createApp(board);
-    mockAgentService.getById.mockResolvedValue({...baseAgent,adapterConfig:{model:"inherited-model",env:{CODEX_HOME:"synthetic-first-home"}}});
+    permitExcept(null);
+    let rawAgent={...baseAgent,adapterConfig:{model:"inherited-model",env:{CODEX_HOME:"synthetic-first-home"}}};
+    const app=await createApp(board,dbWithAgent(()=>rawAgent));
+    mockAgentService.getById.mockResolvedValue(rawAgent);
     const first=await requestApp(app,url=>request(url).get(`${path}/controls`));
-    mockAgentService.getById.mockResolvedValue({...baseAgent,adapterConfig:{model:"inherited-model",env:{CODEX_HOME:"synthetic-second-home"}}});
+    rawAgent={...rawAgent,adapterConfig:{model:"inherited-model",env:{CODEX_HOME:"synthetic-second-home"}}};
+    mockAgentService.getById.mockResolvedValue(rawAgent);
     const second=await requestApp(app,url=>request(url).get(`${path}/controls`));
     expect(first.status).toBe(200);expect(second.status).toBe(200);
     expect(first.body.expectedControlHash).not.toBe(second.body.expectedControlHash);
     expect(JSON.stringify([first.body,second.body])).not.toContain("synthetic-first-home");
     expect(JSON.stringify([first.body,second.body])).not.toContain("synthetic-second-home");
+  });
+
+  it.each([{}, { canCreateAgents: true }])("seals raw legacy permissions despite the actual service projection: %j", async permissions => {
+    permitExcept(null);
+    const rawAgent = { ...baseAgent, permissions };
+    const db = { select: () => ({ from: () => ({ where: () => Object.assign(Promise.resolve([rawAgent]), { groupBy: async () => [] }) }) }) };
+    const { agentService: actualAgentService } = await vi.importActual<typeof import("../services/agents.js")>("../services/agents.js");
+    const projected = await actualAgentService(db as any).getById(agentId);
+    expect(projected!.permissions).not.toEqual(rawAgent.permissions);
+    mockAgentService.getById.mockResolvedValue(projected);
+    const app = await createApp(board, db);
+    const response = await requestApp(app, url => request(url).get(`${path}/controls`));
+    const { taskExecutionControlSeal } = await import("../services/heartbeat/task-execution-lease-store.js");
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(taskExecutionControlSeal(rawAgent as any));
+    expect(response.body.expectedControlHash).not.toBe(taskExecutionControlSeal(projected as any).expectedControlHash);
+  });
+
+  it.each([null, { ...baseAgent, companyId: "44444444-4444-4444-8444-444444444444" }])("hides a disappeared or moved raw agent after permission checks", async row => {
+    permitExcept(null);
+    const app = await createApp(board, dbWithAgent(row));
+    const response = await requestApp(app, url => request(url).get(`${path}/controls`));
+    expect(response.status).toBe(404);
+    expect(mockAccessService.decide.mock.calls.map(([input]) => input.action)).toEqual(["agent:wake", "agents:create"]);
+    expect(mockHeartbeatService.invokeTaskExecutionLease).not.toHaveBeenCalled();
+  });
+  it("reads fresh raw status and controls only after authorization", async () => {
+    permitExcept(null);
+    const fresh = { ...baseAgent, status: "paused", permissions: {}, adapterConfig: { model: "fresh-model" } };
+    const db = dbWithAgent(fresh);
+    const app = await createApp(board, db);
+    db.select.mockClear();
+    const response = await requestApp(app, url => request(url).get(`${path}/controls`));
+    const { taskExecutionControlSeal } = await import("../services/heartbeat/task-execution-lease-store.js");
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(taskExecutionControlSeal(fresh as any));
+    expect(db.select).toHaveBeenCalledTimes(1);
+    expect(mockAccessService.decide.mock.invocationCallOrder.at(-1)).toBeLessThan(db.select.mock.invocationCallOrder[0]);
+  });
+  it("does not read authoritative raw controls when management permission denies", async () => {
+    permitExcept("agents:create");
+    const db = dbWithAgent(baseAgent);
+    const app = await createApp(board, db);
+    db.select.mockClear();
+    const response = await requestApp(app, url => request(url).get(`${path}/controls`));
+    expect(response.status).toBe(403);
+    expect(db.select).not.toHaveBeenCalled();
   });
 
 });

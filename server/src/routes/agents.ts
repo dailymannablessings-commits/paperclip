@@ -1,4 +1,4 @@
-import { taskExecutionControlSeal } from "../services/heartbeat/task-execution-lease-store.js";
+import { readTaskExecutionControlSeal } from "../services/heartbeat/task-execution-lease-store.js";
 import {taskExecutionLeaseSchema} from "../services/heartbeat/task-execution-lease-schema.js";
 import { listOpenRouterModels } from "../services/openrouter-models.js";
 import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings } from "../services/ai-connection-runtime.js";
@@ -5896,7 +5896,9 @@ export function agentRoutes(
     await assertBoardCanWakeAgent(req, agent);
     await assertBoardCanManageAgentsForCompany(req, agent.companyId);
     if (!req.actor.userId) throw forbidden("Board user context required");
-    res.set("Cache-Control", "no-store").json(taskExecutionControlSeal(agent));
+    const seal = await readTaskExecutionControlSeal(db, agent.id, agent.companyId);
+    if (!seal) throw notFound("Agent not found");
+    res.set("Cache-Control", "no-store").json(seal);
   });
 
   router.post("/agents/:id/task-execution-lease",validate(taskExecutionLeaseSchema),async(req,res)=>{

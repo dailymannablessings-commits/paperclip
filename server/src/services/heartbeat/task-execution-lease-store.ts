@@ -18,6 +18,12 @@ export function taskExecutionControlSeal(agent:typeof agents.$inferSelect){
  const authoritative=controls(agent);
  return {agentId:agent.id,companyId:agent.companyId,status:agent.status,expectedControlHash:executionControlHash(authoritative),expectedModel:typeof authoritative.adapterConfig.model==='string'?authoritative.adapterConfig.model:null};
 }
+/** Public service projections normalize permissions. Seal only fresh persisted controls. */
+export async function readTaskExecutionControlSeal(db:Db,agentId:string,companyId:string){
+ const [agent]=await db.select().from(agents).where(and(eq(agents.id,agentId),eq(agents.companyId,companyId)));
+ if(!agent||agent.id!==agentId||agent.companyId!==companyId)return null;
+ return taskExecutionControlSeal(agent);
+}
 export function hasTaskExecutionLease(run:Pick<Run,'contextSnapshot'>):boolean{return Object.hasOwn(object(run.contextSnapshot),PAUSED_TASK_LEASE_KEY);}
 export async function validTaskExecutionLease(db:Db,run:Run,now=new Date()):Promise<boolean>{
  try{
