@@ -1,3 +1,4 @@
+import {taskExecutionLeaseBlocksAutomaticChild} from "../../../services/heartbeat/task-execution-lease-store.js";
 import { isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
@@ -548,6 +549,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           "wake-queue: recovery source does not match the locked execution",
         );
       }
+      if(await taskExecutionLeaseBlocksAutomaticChild(tx,companyId,runId))return true;
       const failedChatRequestOwner = run.wakeupRequestId
         ? await tx
             .select({ id: chatActions.id })
@@ -570,6 +572,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async queueReviewParticipantRecoveryRun({ companyId, issue, finishingRun, recoveryAgent, sessionBefore, now }) {
+      if(await taskExecutionLeaseBlocksAutomaticChild(tx,companyId,finishingRun.id))throw new Error("bounded_task_lease_automatic_child_forbidden");
       const executionState = parseIssueExecutionState(issue.executionState);
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
@@ -657,6 +660,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       sessionBefore,
       now,
     }) {
+      if(await taskExecutionLeaseBlocksAutomaticChild(tx,companyId,finishingRun.id))throw new Error("bounded_task_lease_automatic_child_forbidden");
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
         .values({

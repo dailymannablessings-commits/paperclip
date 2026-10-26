@@ -1,4 +1,4 @@
-import {validTaskExecutionLease,hasTaskExecutionLease} from "../heartbeat/task-execution-lease-store.js";
+import {hasTaskExecutionLeaseAncestor,validTaskExecutionLease,hasTaskExecutionLease} from "../heartbeat/task-execution-lease-store.js";
 import { and, desc, eq, isNull } from "drizzle-orm";
 
 import type { Db } from "@paperclipai/db";
@@ -343,6 +343,7 @@ export class PaperclipRunnerSemanticAuthority {
     const validLease=leased && await validTaskExecutionLease(this.#db,context.run);
     if (
       !["queued", "running"].includes(context.run.status) ||
+      await hasTaskExecutionLeaseAncestor(this.#db,context.run) ||
       (leased && !validLease) ||
       (activeAgentStatus(context.agent.status) !== "active" && !(context.agent.status==="paused" && validLease)) ||
       (requireOwnership &&

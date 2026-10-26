@@ -1,3 +1,4 @@
+import {taskExecutionLeaseBlocksAutomaticChild} from "../heartbeat/task-execution-lease-store.js";
 import { hasLiveLegacyController } from "../legacy-controller-lease.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { isWaitingConversation, settleConversationTurn, deliverConversationComments } from "../agent-conversations.js";
@@ -2564,6 +2565,7 @@ export function recoveryService(
     actionId: string;
     agentId: string;
   }) {
+    if(input.latestRun && await taskExecutionLeaseBlocksAutomaticChild(db,input.issue.companyId,input.latestRun.id))return null;
     const existing = await db
       .select()
       .from(heartbeatRuns)
@@ -3086,6 +3088,7 @@ export function recoveryService(
   }) {
     const agentId = input.issue.assigneeAgentId;
     if (!agentId) return null;
+    if(input.latestRun && await taskExecutionLeaseBlocksAutomaticChild(db,input.issue.companyId,input.latestRun.id))return null;
     const timing = dispositionRepairDelayMs(input.attempt, input.fingerprint);
     const now = new Date();
     const retryAt = new Date(now.getTime() + timing.delayMs);

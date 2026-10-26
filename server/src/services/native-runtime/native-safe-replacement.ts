@@ -18,6 +18,7 @@ import { issueService } from "../issues.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { buildExecutionContinuation } from "../execution-continuation.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { hasTaskExecutionLease,hasTaskExecutionLeaseAncestor } from "../heartbeat/task-execution-lease-store.js";
 
 export const NATIVE_SAFE_REPLACEMENT_REASON = "native_safe_replacement";
 const record = (v: unknown): Record<string, unknown> =>
@@ -71,6 +72,9 @@ export async function reconcileSafeNativeReplacements(
   let scheduled = 0;
   for (const { run, coordinator } of candidates) {
     try {
+      // One board receipt permits one provider run. The ordinary replacement
+      // producer writes directly to the queue, so it must honor that boundary.
+      if (hasTaskExecutionLease(run)||await hasTaskExecutionLeaseAncestor(db,run)) continue;
       if (
         coordinator.failureDetail?.successorRunId ||
         coordinator.failureDetail?.replacementDenied
@@ -253,6 +257,8 @@ export async function reconcileSafeNativeReplacements(
             .from(nativeRunFinalizations)
             .where(eq(nativeRunFinalizations.runId, run.id))
             .for("update");
+          const [currentSource] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,run.id),eq(heartbeatRuns.companyId,run.companyId),eq(heartbeatRuns.agentId,run.agentId))).for("update");
+          if (!currentSource || hasTaskExecutionLease(currentSource)||await hasTaskExecutionLeaseAncestor(tx as unknown as Db,currentSource)) return;
           if (
             !current ||
             current.phase !== "terminal_failure" ||
@@ -316,6 +322,8 @@ export async function reconcileSafeNativeReplacements(
           .from(nativeRunFinalizations)
           .where(eq(nativeRunFinalizations.runId, run.id))
           .for("update");
+        const [currentSource] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,run.id),eq(heartbeatRuns.companyId,run.companyId),eq(heartbeatRuns.agentId,run.agentId))).for("update");
+        if (!currentSource || hasTaskExecutionLease(currentSource)||await hasTaskExecutionLeaseAncestor(tx as unknown as Db,currentSource)) return false;
         if (
           !task ||
           task.assigneeAgentId !== run.agentId ||

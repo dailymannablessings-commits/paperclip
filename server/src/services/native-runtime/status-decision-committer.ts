@@ -1,3 +1,4 @@
+import {taskExecutionLeaseBlocksAutomaticChild} from "../heartbeat/task-execution-lease-store.js";
 import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { CreateIssueThreadInteraction } from "@paperclipai/shared";
@@ -398,6 +399,7 @@ function failAt(
 }
 
 async function enqueueWake(input: {
+  sourceRunId: string;
   tx: Db;
   companyId: string;
   issueId: string;
@@ -407,6 +409,7 @@ async function enqueueWake(input: {
   payload: Record<string, unknown>;
   contextSnapshot?: Record<string, unknown>;
 }) {
+  if(await taskExecutionLeaseBlocksAutomaticChild(input.tx,input.companyId,input.sourceRunId))return null;
   const existing = await input.tx
     .select({ id: agentWakeupRequests.id })
     .from(agentWakeupRequests)
@@ -437,6 +440,7 @@ async function enqueueWake(input: {
         issueId: input.issueId,
         taskId: input.issueId,
         ...input.payload,
+        sourceRunId:input.sourceRunId,
         _paperclipWakeContext: {
           issueId: input.issueId,
           taskId: input.issueId,
@@ -626,6 +630,7 @@ async function materializeDecisionEffect(input: {
   }
   if (effect.kind === "notify_owner") {
     const wakeId = await enqueueWake({
+      sourceRunId: input.runId,
       tx: input.tx,
       companyId: input.companyId,
       issueId: input.issue.id,
@@ -702,6 +707,7 @@ async function materializeDecisionEffect(input: {
         };
     }
     const wakeId = await enqueueWake({
+      sourceRunId: input.runId,
       tx: input.tx,
       companyId: input.companyId,
       issueId: input.issue.id,
@@ -747,6 +753,7 @@ async function materializeDecisionEffect(input: {
     let wakeId: string | null = null;
     if (effect.owner !== "board") {
       wakeId = await enqueueWake({
+      sourceRunId: input.runId,
         tx: input.tx,
         companyId: input.companyId,
         issueId: input.issue.id,
@@ -769,6 +776,7 @@ async function materializeDecisionEffect(input: {
   if (effect.kind === "schedule_retry") {
     failAt("continuation_materialization", input.failpoint);
     const wakeId = await enqueueWake({
+      sourceRunId: input.runId,
       tx: input.tx,
       companyId: input.companyId,
       issueId: input.issue.id,
@@ -1929,6 +1937,7 @@ export async function commitNativeStatusDecision(input: {
               }
             : null;
         const wakeId = await enqueueWake({
+      sourceRunId: input.runId,
           tx: tx as unknown as Db,
           companyId: input.companyId,
           issueId: dependent.id,
@@ -1959,6 +1968,7 @@ export async function commitNativeStatusDecision(input: {
       }
       if (parent && !parentIsDependent) {
         const wakeId = await enqueueWake({
+      sourceRunId: input.runId,
           tx: tx as unknown as Db,
           companyId: input.companyId,
           issueId: parent.id,
