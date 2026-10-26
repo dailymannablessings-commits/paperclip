@@ -147,7 +147,34 @@ async function runPnpm(cwd: string, args: string[]) {
   await execFileAsync("pnpm", args, { cwd });
 }
 
+// Config-writer fixtures deliberately use minimal source config, not the CLI's
+// full instance schema. Never discover a developer's installed CLI or home here.
+let configWriterFixtureCleanup: (() => Promise<void>) | null = null;
+async function isolateConfigWriterFixture() {
+  if (configWriterFixtureCleanup) return;
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-config-writer-"));
+  const bin = path.join(root, "bin");
+  await fs.mkdir(bin);
+  const previous = Object.fromEntries(["PATH", "PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID", "PAPERCLIP_WORKTREES_DIR"]
+    .map((key) => [key, process.env[key]]));
+  const pnpm = (await execFileAsync("which", ["pnpm"])).stdout.trim();
+  await fs.symlink(process.execPath, path.join(bin, "node"));
+  await fs.symlink(await fs.realpath(pnpm), path.join(bin, "pnpm"));
+  process.env.PATH = [bin, "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(path.delimiter);
+  process.env.PAPERCLIP_HOME = path.join(root, "home");
+  process.env.PAPERCLIP_INSTANCE_ID = "config-writer-fixture";
+  process.env.PAPERCLIP_WORKTREES_DIR = path.join(root, "worktrees");
+  configWriterFixtureCleanup = async () => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  };
+}
+
 async function writeRegisteredSourceConfig(baseCwd: string, instanceId = "source-instance") {
+  await isolateConfigWriterFixture();
   const configDir = path.join(baseCwd, ".paperclip");
   await fs.mkdir(configDir, { recursive: true });
   await fs.writeFile(path.join(configDir, "config.json"), "{}\n", "utf8");
@@ -449,6 +476,32 @@ afterEach(async () => {
   delete process.env.PAPERCLIP_WORKTREES_DIR;
   delete process.env.DATABASE_URL;
   await resetRuntimeServicesForTests();
+  const cleanup = configWriterFixtureCleanup;
+  configWriterFixtureCleanup = null;
+  await cleanup?.();
+});
+
+it("keeps config-writer fixtures independent of an installed CLI and owner home", async () => {
+  const fakeBin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ambient-cli-"));
+  const previousPath = process.env.PATH;
+  const previousHome = process.env.PAPERCLIP_HOME;
+  await fs.writeFile(path.join(fakeBin, "paperclipai"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  process.env.PATH = `${fakeBin}${path.delimiter}${previousPath ?? ""}`;
+  try {
+    await isolateConfigWriterFixture();
+    await expect(execFileAsync("which", ["paperclipai"])).rejects.toBeDefined();
+    expect(process.env.PAPERCLIP_HOME).not.toBe(previousHome);
+    expect(process.env.PAPERCLIP_WORKTREES_DIR).toContain("paperclip-config-writer-");
+    await expect(execFileAsync("node", ["--version"])).resolves.toBeDefined();
+    await expect(execFileAsync("pnpm", ["--version"])).resolves.toBeDefined();
+  } finally {
+    const cleanup = configWriterFixtureCleanup;
+    configWriterFixtureCleanup = null;
+    await cleanup?.();
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await fs.rm(fakeBin, { recursive: true, force: true });
+  }
 });
 
 describe("sanitizeRuntimeServiceBaseEnv", () => {
@@ -6513,10 +6566,11 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     const issueId = randomUUID();
     const executionWorkspaceId = randomUUID();
     const provisionMarkerPath = path.join(workspaceRoot, "runtime-provisioning.marker");
+    const provisionReleasePath = path.join(workspaceRoot, "runtime-provision-release.marker");
     const markerPath = path.join(workspaceRoot, "runtime-spawned.marker");
     const provisionScript = [
       `require("node:fs").writeFileSync(${JSON.stringify(provisionMarkerPath)}, "provisioning");`,
-      "setTimeout(() => {}, 1200);",
+      `const timer=setInterval(()=>{if(require("node:fs").existsSync(${JSON.stringify(provisionReleasePath)}))clearInterval(timer);},10);`,
     ].join(" ");
     const runtimeProvisionCommand =
       `${JSON.stringify(process.execPath)} -e ${JSON.stringify(provisionScript)}`;
@@ -6577,9 +6631,11 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
       baseRef: "main",
     });
 
+    let startupFailure: unknown;
     const waitForMarker = async (filePath: string) => {
       const deadline = Date.now() + 5_000;
       while (Date.now() < deadline) {
+        if (startupFailure) throw startupFailure;
         if (existsSync(filePath)) return;
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
@@ -6646,7 +6702,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
       },
       adapterEnv: {},
     });
-    startPromise.catch(() => undefined);
+    startPromise.catch((error: unknown) => { startupFailure = error; });
 
     try {
       await waitForMarker(provisionMarkerPath);
@@ -6658,6 +6714,11 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
         providerRef: null,
       });
       expect(existsSync(markerPath)).toBe(false);
+      // Hold provisioning longer than readiness's one-second budget, after the
+      // parent has actually observed its persisted state. Scheduler speed must
+      // not determine whether that intermediate state can be asserted.
+      await new Promise((resolve) => setTimeout(resolve, 1_200));
+      await fs.writeFile(provisionReleasePath, "release");
 
       await waitForMarker(markerPath);
       const startingRow = await waitForPersistedStatus("starting");
@@ -6697,6 +6758,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
         }),
       ]);
     } finally {
+      await fs.writeFile(provisionReleasePath, "release").catch(() => undefined);
       await startPromise.catch(() => undefined);
       await stopRuntimeServicesForExecutionWorkspace({
         db,
@@ -7259,7 +7321,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     const blockerScript = [
       "const net=require('node:net');",
       "const port=Number(process.argv[1]);",
-      "net.createServer((socket)=>socket.destroy()).listen(port,'127.0.0.1');",
+      "net.createServer((socket)=>socket.destroy()).listen(port,'127.0.0.1',()=>{process.send?.('listening');process.disconnect?.();});",
     ].join("");
     const raceScript = [
       "const fs=require('node:fs');",
@@ -7272,8 +7334,10 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
       "const start=()=>http.createServer((_req,res)=>res.end('ok')).listen(port,'127.0.0.1');",
       "if(!fs.existsSync(marker)){",
       "fs.writeFileSync(marker,String(port));",
-      "const blocker=spawn(process.execPath,['-e',blockerScript,String(port)],{detached:true,stdio:'ignore'});",
-      "fs.writeFileSync(pidFile,String(blocker.pid));blocker.unref();setTimeout(start,200);",
+      "const blocker=spawn(process.execPath,['-e',blockerScript,String(port)],{detached:true,stdio:['ignore','ignore','ignore','ipc']});",
+      "fs.writeFileSync(pidFile,String(blocker.pid));blocker.unref();",
+      "const deadline=setTimeout(()=>process.exit(1),5000);",
+      "blocker.once('error',()=>process.exit(1));blocker.once('message',(message)=>{if(message==='listening'){clearTimeout(deadline);start();}});",
       "}else{start();}",
       "setInterval(()=>{},1000);",
     ].join("");
@@ -7359,7 +7423,10 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
       await cleanupRuntimeHome();
       await fixture.cleanup();
     }
-  }, 20_000);
+  // Every real attempt includes the supervisor's 250ms stability probe, process
+  // launch, ownership probes and DB cleanup; preserve all 32 rather than racing
+  // the old 20-second whole-test deadline. Production readiness bounds are intact.
+  }, WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS * 2_000 + 10_000);
 
   it("returns a bounded structured conflict and exposes only same-company workspace references", async () => {
     const fixture = await createRuntimeFixture({
