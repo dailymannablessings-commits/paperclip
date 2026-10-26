@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -344,6 +344,92 @@ test("wait_for_npm_package_versions polls every package concurrently", () => {
   assert.match(result.output, /@paperclipai\/alpha@1\.2\.3 is registry-visible/);
   assert.match(result.output, /@paperclipai\/beta@1\.2\.3 is registry-visible/);
 });
+
+test("visibility cleanup survives its caller function scope and preserves the caller EXIT trap", () => {
+  const fixture = mkdtempSync(join(tmpdir(), "visibility scope "));
+  try {
+    const output = execFileSync("bash", ["-c", `
+set -euo pipefail
+source "$RELEASE_LIB"
+trap 'printf caller-cleanup > "$FIXTURE/caller-exit"' EXIT
+wait_for_npm_package_version() { return 0; }
+caller() {
+  local status_dir=caller-owned
+  local pids=(caller-owned)
+  wait_for_npm_package_versions 1 0 $'fixture\\t@fixture/one\\t1.0.0'
+  test "$status_dir" = caller-owned
+  test "\${pids[0]}" = caller-owned
+}
+caller
+wait_for_npm_package_versions 1 0 ''
+printf completed
+`], { encoding: "utf8", env: { ...process.env, RELEASE_LIB: join(repoRoot, "scripts/release-lib.sh"), FIXTURE: fixture, TMPDIR: fixture } });
+    assert.equal(output, "    ✓ @fixture/one@1.0.0 is registry-visible\ncompleted");
+    assert.equal(readFileSync(join(fixture, "caller-exit"), "utf8"), "caller-cleanup");
+    assert.deepEqual(readdirSync(fixture), ["caller-exit"]);
+  } finally { rmSync(fixture, { recursive: true, force: true }); }
+});
+
+for (const [signal, status, ignoreTerm] of [["SIGINT", 130, false], ["SIGTERM", 143, false], ["SIGTERM", 143, true]]) {
+  test(`visibility ${signal}${ignoreTerm ? " with a TERM-ignoring child" : ""} reaps owned poll descendants, removes scratch and preserves foreign caller work`, async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "visibility signal "));
+    const pollerScript = join(fixture, "poller.cjs");
+    const pollerMarker = join(fixture, "poller.json");
+    writeFileSync(pollerScript, `${ignoreTerm ? "process.on('SIGTERM',()=>{});" : ""}require('node:fs').writeFileSync(process.argv[2],JSON.stringify({pid:process.pid,parent:process.ppid}));setInterval(()=>{},1000);`);
+    const child = spawn("bash", ["-c", `
+set -uo pipefail
+source "$RELEASE_LIB"
+trap 'printf caller-cleanup > "$FIXTURE/caller-exit"' EXIT
+"$NODE" -e 'setInterval(()=>{},1000)' &
+foreign=$!
+wait_for_npm_package_version() { "$NODE" "$FIXTURE/poller.cjs" "$FIXTURE/poller.json"; }
+wait_for_npm_package_versions 100 1 $'fixture\\t@fixture/one\\t1.0.0'
+result=$?
+if kill -0 "$foreign" 2>/dev/null; then printf preserved > "$FIXTURE/foreign-preserved"; fi
+kill "$foreign" 2>/dev/null || true
+wait "$foreign" 2>/dev/null || true
+exit "$result"
+`], { detached: true, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, RELEASE_LIB: join(repoRoot, "scripts/release-lib.sh"), FIXTURE: fixture, TMPDIR: fixture, NODE: process.execPath } });
+    let diagnostic = "";
+    let closed = false;
+    child.stderr.on("data", (data) => { diagnostic += data; });
+    const exited = new Promise((resolve, reject) => { child.once("error", reject); child.once("close", (code) => { closed = true; resolve(code); }); });
+    let poller;
+    let owner;
+    try {
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(pollerMarker) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.ok(existsSync(pollerMarker), diagnostic);
+      poller = JSON.parse(readFileSync(pollerMarker, "utf8"));
+      owner = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(poller.parent)], { encoding: "utf8" }).trim());
+      assert.ok(owner > 1 && owner !== process.pid && owner !== child.pid);
+      process.kill(owner, signal);
+      let timeout;
+      const code = await Promise.race([exited, new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("visibility cancellation did not settle")), 10_000); })]).finally(() => clearTimeout(timeout));
+      assert.equal(code, status, diagnostic);
+      assert.equal(readFileSync(join(fixture, "caller-exit"), "utf8"), "caller-cleanup");
+      assert.equal(readFileSync(join(fixture, "foreign-preserved"), "utf8"), "preserved");
+      assert.ok(!readdirSync(fixture).some((name) => name.startsWith("paperclip-release-visibility.")));
+      const proc = spawnSync("ps", ["-o", "stat=", "-p", String(poller.pid)], { encoding: "utf8" });
+      assert.ok(proc.status !== 0 || /^Z/.test(proc.stdout.trim()), `owned poll descendant survived: ${proc.stdout}`);
+    } finally {
+      // A broken implementation can orphan a grandchild that keeps captured
+      // pipes open after the shell exits. Reconcile its exact fixture command.
+      if (!closed && poller?.pid) {
+        const command = spawnSync("ps", ["-o", "command=", "-p", String(poller.pid)], { encoding: "utf8" });
+        if (command.status === 0 && command.stdout.includes(pollerScript)) {
+          try { process.kill(poller.pid, "SIGKILL"); } catch {}
+        }
+      }
+      if (child.exitCode === null && child.signalCode === null) {
+        if (poller?.parent) { try { process.kill(-poller.parent, "SIGKILL"); } catch {} }
+        try { process.kill(-child.pid, "SIGKILL"); } catch {}
+      }
+      await exited.catch(() => undefined);
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+}
 
 test("the workflow budget tolerates the observed 15-minute 20-second registry delay", () => {
   const budget = workflowVerifyBudget();

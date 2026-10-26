@@ -441,18 +441,43 @@ wait_for_npm_package_versions() {
     local pkg_name
     local pkg_version
     local i
+    local cleanup_command
 
     status_dir="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-release-visibility.XXXXXX")"
 
     # shellcheck disable=SC2329 # invoked via the trap below
     reap_visibility_pollers() {
+      trap - EXIT INT TERM
+      local scratch_dir="$1"
+      local active_pids=()
       local pid
-      for pid in ${pids[@]+"${pids[@]}"}; do
-        kill "$pid" 2>/dev/null || true
+      # Only this subshell's still-running jobs are ours. Each poll has its
+      # own process group, so npm and sleep children cannot outlive cancellation.
+      # Completed PIDs must not be signalled: the OS may already have reused them.
+      for pid in $(jobs -pr); do
+        active_pids+=("$pid")
+        kill -TERM -- "-$pid" 2>/dev/null || true
       done
-      rm -rf "$status_dir"
+      if [ "${#active_pids[@]}" -gt 0 ]; then
+        # A child may ignore TERM while its poll shell exits. Bound cleanup
+        # and finish the exact groups owned above before waiting/reaping.
+        sleep 0.1
+        for pid in "${active_pids[@]}"; do
+          kill -KILL -- "-$pid" 2>/dev/null || true
+        done
+      fi
+      for pid in ${active_pids[@]+"${active_pids[@]}"}; do
+        wait "$pid" 2>/dev/null || true
+      done
+      rm -rf -- "$scratch_dir"
     }
-    trap reap_visibility_pollers EXIT INT TERM
+    # Bash 3.2 unwinds function locals before this subshell's EXIT trap runs.
+    # Capture the owned path as a shell-quoted literal while it is in scope.
+    printf -v cleanup_command 'reap_visibility_pollers %q' "$status_dir"
+    trap "$cleanup_command" EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    set -m
 
     while IFS=$'\t' read -r _pkg_dir pkg_name pkg_version; do
       [ -z "$pkg_name" ] && continue
