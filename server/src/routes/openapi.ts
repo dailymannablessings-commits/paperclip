@@ -32,6 +32,7 @@ import {
   writeStatusCardQuerySchema,
   writeStatusCardSummarySchema,
   wakeAgentSchema,
+  taskExecutionLeaseSchema,
   resetAgentSessionSchema,
   agentSkillSyncSchema,
   testAdapterEnvironmentSchema,
@@ -3400,6 +3401,16 @@ registry.registerPath({
     404: r.notFound,
     409: r.conflict,
   },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/agents/{id}/task-execution-lease",
+  tags: ["agents"],
+  summary: "Run one exact task without globally resuming an agent",
+  description: "Board-only admission requires agent wake, company agent-management and task-mutation permission. The request binds an inherited model, exact source head, current control hash, strict task profile, idempotency key and at most thirty minutes of authority. The role status and foreign queued work are preserved; retries and automatic child runs require a new explicit lease.",
+  request: { params: z.object({ id: z.string() }), body: jsonBody(taskExecutionLeaseSchema) },
+  responses: { 202: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({

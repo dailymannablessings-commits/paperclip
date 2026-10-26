@@ -912,3 +912,15 @@ describe("openapi routes", () => {
     expect(codes).toEqual(["200", "401", "403", "404"]);
   });
 });
+
+
+describe("bounded task lease API contract", () => {
+  it("documents the strict shared request and permission/conflict responses", () => {
+    const {spec}=loadSpecRoutes();
+    const route=spec.paths["/api/agents/{id}/task-execution-lease"].post;
+    expect(Object.keys(route.responses).sort()).toEqual(["202","400","401","403","404","409"]);
+    const schema=route.requestBody.content["application/json"].schema;
+    expect(schema.additionalProperties).toBe(false);
+    expect(schema.required).toEqual(expect.arrayContaining(["issueId","idempotencyKey","headSha","expectedControlHash","expectedModel","scopeDescription","profile","expiresAt"]));
+  });
+});

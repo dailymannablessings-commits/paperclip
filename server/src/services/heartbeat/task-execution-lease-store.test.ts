@@ -5,11 +5,12 @@ import {join} from 'node:path';
 import {createServer} from 'node:http';
 import {runnerPrpCoordinator} from '../native-runtime/runner-prp-coordinator.js';
 import {setupRunnerPrpWebSocketServer,runnerPrpWebSocketInternals} from '../../realtime/runner-prp-ws.js';
+import {processAdapter} from '../../adapters/process/index.js';
 import {heartbeatService} from '../heartbeat.js';
 import {PaperclipRunnerSemanticAuthority} from '../native-runtime/runner-semantic-authority.js';
-import {beforeAll,afterAll,describe,it,expect} from 'vitest';
+import {beforeAll,afterAll,afterEach,describe,it,expect} from 'vitest';
 import {eq,and,sql} from 'drizzle-orm';
-import {createDb,startEmbeddedPostgresTestDatabase,agents,companies,issues,agentWakeupRequests,heartbeatRuns,activityLog,completionContracts,nativeRunFinalizations} from '@paperclipai/db';
+import {createDb,startEmbeddedPostgresTestDatabase,agents,companies,issues,agentWakeupRequests,heartbeatRuns,activityLog,completionContracts,nativeRunFinalizations,agentTaskSessions} from '@paperclipai/db';
 import {createTaskExecutionLease,validTaskExecutionLease,releaseTaskExecutionLease,stripTaskExecutionLease} from './task-execution-lease-store.js';
 import {executionControlHash,PAUSED_TASK_LEASE_KEY} from './paused-task-execution.js';
 
@@ -18,10 +19,13 @@ describe('task execution lease PostgreSQL admission',()=>{
  let db:ReturnType<typeof createDb>;
  beforeAll(async()=>{temp=await startEmbeddedPostgresTestDatabase('paperclip-task-lease-test-');db=createDb(temp.connectionString)},60_000);
  afterAll(async()=>{await temp?.cleanup()});
+ // Each scheduler integration test must see only its own synthetic queue.
+ // Otherwise resumeQueuedRuns could dispatch stale fixtures from earlier cases.
+ afterEach(async()=>{await db.execute(sql`TRUNCATE TABLE companies CASCADE`)});
  async function fixture(status:'idle'|'paused'='paused',heartbeat:Record<string,unknown>={},adapterType='codex_local'){
   const companyId=randomUUID(),agentId=randomUUID(),issueId=randomUUID();
   await db.insert(companies).values({id:companyId,name:'Synthetic lease fixture',issuePrefix:'T'+companyId.slice(0,7).toUpperCase()});
-  await db.insert(agents).values({id:agentId,companyId,name:'Bounded fixture',role:'engineer',status,adapterType,adapterConfig:{model:'fixture-existing-model'},runtimeConfig:{heartbeat:{enabled:false,maxConcurrentRuns:1,...heartbeat}},permissions:{}});
+  await db.insert(agents).values({id:agentId,companyId,name:'Bounded fixture',role:'engineer',status,adapterType,adapterConfig:{model:'fixture-existing-model',...(adapterType==='process'?{command:'/usr/bin/true'}:{})},runtimeConfig:{heartbeat:{enabled:false,maxConcurrentRuns:1,...heartbeat}},permissions:{}});
   await db.insert(issues).values({id:issueId,companyId,title:'Synthetic exact head review',description:'original',status:'backlog'});
   const [agent]=await db.select().from(agents).where(eq(agents.id,agentId));
   const request={issueId,idempotencyKey:randomUUID(),headSha:'a'.repeat(40),expectedModel:'fixture-existing-model',expectedControlHash:executionControlHash({id:agent.id,companyId:agent.companyId,status:agent.status,adapterType:agent.adapterType,role:agent.role,capabilities:agent.capabilities,pauseReason:agent.pauseReason,pausedAt:agent.pausedAt,adapterConfig:agent.adapterConfig,runtimeConfig:agent.runtimeConfig,budgetMonthlyCents:agent.budgetMonthlyCents,reportsTo:agent.reportsTo,permissions:agent.permissions}),scopeDescription:'Read exact head '+ 'a'.repeat(40),profile:{adapterConfig:{command:adapterType==='process'?'/usr/bin/true':'/fixture/official-codex',extraArgs:adapterType==='process'?[]:['-c','tool_output_token_limit=1000']}},expiresAt:new Date(Date.now()+20*60_000).toISOString()};
@@ -196,6 +200,44 @@ describe('task execution lease PostgreSQL admission',()=>{
    const [agent]=await db.select().from(agents).where(eq(agents.id,f.agentId));expect(agent.status).toBe('idle');
    expect(terminal).toMatchObject({status:'cancelled',error:'Single-use task execution lease cannot restart a provider attempt'});
    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId,f.agentId))).toHaveLength(1);
+  }finally{await service.drainActiveRunExecutions()}
+ });
+ it('keeps an actual foreign queued heartbeat untouched while an idle-role lease owns a second available slot',async()=>{
+  const f=await fixture('idle',{maxConcurrentRuns:2},'process');const leased=await createTaskExecutionLease(db,f);
+  await db.update(heartbeatRuns).set({status:'running',controllerLeaseExpiresAt:new Date(Date.now()+60_000)}).where(eq(heartbeatRuns.id,leased.id));
+  await db.update(agents).set({status:'running'}).where(eq(agents.id,f.agentId));
+  const [foreign]=await db.insert(heartbeatRuns).values({companyId:f.companyId,agentId:f.agentId,responsibleUserId:f.actorUserId,status:'queued',invocationSource:'on_demand',triggerDetail:'manual',contextSnapshot:{syntheticForeignWork:true}}).returning();
+  const service=heartbeatService(db,{runtimeEnv:{}});
+  try{
+   await service.resumeQueuedRuns();await service.drainActiveRunExecutions();
+   const [unchanged]=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,foreign.id));
+   expect(unchanged).toEqual(foreign);
+   expect(await validTaskExecutionLease(db,leased)).toBe(true);
+  }finally{await service.drainActiveRunExecutions()}
+ });
+ it('successful bounded work cannot roll an active goal into another run',async()=>{
+  const f=await fixture('idle',{},'process');
+  await db.insert(agentTaskSessions).values({companyId:f.companyId,agentId:f.agentId,adapterType:'process',taskKey:f.request.issueId,goalJson:{objective:'Synthetic continuing goal',status:'active'},goalStatus:'active',goalDesiredState:'active'});
+  const original=processAdapter.execute;
+  processAdapter.execute=async()=>({exitCode:0,signal:null,timedOut:false,resultJson:{summary:'Synthetic bounded completion',goalRolloverRequired:true}});
+  const service=heartbeatService(db,{runtimeEnv:{}});
+  try{
+   const run=await service.invokeTaskExecutionLease(f.agentId,f.actorUserId,f.request);await service.drainActiveRunExecutions();
+   expect(await service.getRun(run.id)).toMatchObject({status:'succeeded'});
+   expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId,f.agentId))).toHaveLength(1);
+   expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId,f.agentId))).toHaveLength(1);
+  }finally{await service.drainActiveRunExecutions();processAdapter.execute=original}
+ });
+ it.each(['sourceRunId','parentRunId','predecessorRunId','goalRolloverFromRunId'])('canonical leased %s cannot authorize a cross-agent automatic child',async alias=>{
+  const f=await fixture('idle',{},'process');const parent=await createTaskExecutionLease(db,f);
+  await db.update(heartbeatRuns).set({status:'succeeded'}).where(eq(heartbeatRuns.id,parent.id));
+  await db.update(companies).set({defaultResponsibleUserId:f.actorUserId}).where(eq(companies.id,f.companyId));
+  const targetId=randomUUID();await db.insert(agents).values({id:targetId,companyId:f.companyId,name:'Synthetic other worker',role:'engineer',status:'idle',adapterType:'process',adapterConfig:{command:'/usr/bin/true'},runtimeConfig:{heartbeat:{enabled:false}},permissions:{}});
+  const service=heartbeatService(db,{runtimeEnv:{}});
+  try{
+   const child=await service.wakeup(targetId,{source:'automation',triggerDetail:'system',reason:'synthetic_continuation',requestedByActorType:'system',requestedByActorId:'synthetic-system',payload:{[alias]:parent.id},contextSnapshot:{[alias]:parent.id}});
+   await service.drainActiveRunExecutions();expect(child).toBeNull();
+   expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId,targetId))).toHaveLength(0);
   }finally{await service.drainActiveRunExecutions()}
  });
  it('ordinary wake context/payload cannot smuggle a lease',()=>{const context={[PAUSED_TASK_LEASE_KEY]:{forged:true},issueId:'preserved'};const payload={[PAUSED_TASK_LEASE_KEY]:{forged:true},commentId:'preserved'};stripTaskExecutionLease(context,payload);expect(context).toEqual({issueId:'preserved'});expect(payload).toEqual({commentId:'preserved'})});

@@ -12971,6 +12971,7 @@ export function heartbeatService(
   async function handleRunLivenessContinuation(
     run: typeof heartbeatRuns.$inferSelect,
   ) {
+    if (hasTaskExecutionLease(run)) return;
     const context = parseObject(run.contextSnapshot);
     if (
       readNonEmptyString(context.goalControlRequestId) ||
@@ -13179,6 +13180,7 @@ export function heartbeatService(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
   ) {
+    if (hasTaskExecutionLease(run)) return;
     if (run.status !== "succeeded") return;
     const context = parseObject(run.contextSnapshot);
     const issueId =
@@ -13496,6 +13498,7 @@ export function heartbeatService(
   async function handleIssueReviewPathDisposition(
     run: typeof heartbeatRuns.$inferSelect,
   ) {
+    if (hasTaskExecutionLease(run)) return;
     const contextSnapshot = parseObject(run.contextSnapshot);
     if (readNonEmptyString(contextSnapshot.goalControlRequestId)) return;
     const issueId =
@@ -17051,6 +17054,10 @@ export function heartbeatService(
     if(!current)return false;
     const [count]=await tx.select({total:sql<number>`count(*)::int`}).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId,run.companyId),eq(heartbeatRuns.agentId,run.agentId),eq(heartbeatRuns.status,"running"),ne(heartbeatRuns.id,run.id)));
     const running=Number(count?.total??0);
+    // The lease is exclusive in both directions, including idle roles that
+    // normally permit multiple concurrent runs. Keep old queued work untouched.
+    const [exclusive]=await tx.select({id:heartbeatRuns.id}).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId,run.companyId),eq(heartbeatRuns.agentId,run.agentId),ne(heartbeatRuns.id,run.id),inArray(heartbeatRuns.status,["queued","running","scheduled_retry"]),sql`${heartbeatRuns.contextSnapshot}->${PAUSED_TASK_LEASE_KEY} is not null`)).limit(1);
+    if(exclusive)return false;
     if(running>=parseHeartbeatPolicy(current).maxConcurrentRuns)return false;
     if(hasTaskExecutionLease(run))return running===0 && await validTaskExecutionLease(tx,run);
     return (await evaluateAgentInvokabilityFromDb(tx,current)).invokable;
@@ -24859,6 +24866,7 @@ export function heartbeatService(
           );
           }
           if (
+            !hasTaskExecutionLease(livenessRun) &&
             outcome === "succeeded" &&
             issueId &&
             parseObject(adapterResult.resultJson).goalRolloverRequired === true
@@ -25990,10 +25998,10 @@ export function heartbeatService(
       await db.insert(agentWakeupRequests).values(request);
       return { created: true };
     };
-    const parentIds=[opts.failedRunId,readNonEmptyString(enrichedContextSnapshot.retryOfRunId),readNonEmptyString(payload?.retryOfRunId),...(opts.requestedByActorType!=="user"?[readNonEmptyString(enrichedContextSnapshot.sourceRunId),readNonEmptyString(payload?.sourceRunId)]:[])].filter((id):id is string=>typeof id==="string"&&isUuidLike(id));
+    const parentIds=[opts.failedRunId,readNonEmptyString(enrichedContextSnapshot.retryOfRunId),readNonEmptyString(payload?.retryOfRunId),...(opts.requestedByActorType!=="user"?["sourceRunId","parentRunId","predecessorRunId","goalRolloverFromRunId"].flatMap(key=>[readNonEmptyString(enrichedContextSnapshot[key]),readNonEmptyString(payload?.[key])]):[])].filter((id):id is string=>typeof id==="string"&&isUuidLike(id));
     for(const parentId of new Set(parentIds)){
       const parent=await getRun(parentId);
-      if(parent && parent.companyId===agent.companyId && parent.agentId===agentId && await canonicalTaskExecutionLease(db,parent)){
+      if(parent && parent.companyId===agent.companyId && await canonicalTaskExecutionLease(db,parent)){
         await writeSkippedRequest("bounded_task_lease_no_retry",{error:"Single-use bounded task execution requires a new explicit task lease"});return null;
       }
     }
