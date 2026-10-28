@@ -327,9 +327,9 @@ describe('task execution lease PostgreSQL admission',()=>{
   const service=heartbeatService(db,{runtimeEnv:{}});
   try{await service.resumeQueuedRuns();await service.drainActiveRunExecutions();expect(await service.getRun(run.id)).toEqual(run);expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id,wake.id)))[0]).toMatchObject({status:'queued',runId:run.id});}finally{await service.drainActiveRunExecutions()}
  });
- it('denies overlarge comment ancestry without assigning it cancellation ownership',async()=>{
+ it.each(['distinct','malformed','duplicate'] as const)('denies overlarge %s comment ancestry without assigning it cancellation ownership',async variant=>{
   const f=await fixture('idle',{},'process');
-  const [run]=await db.insert(heartbeatRuns).values({companyId:f.companyId,agentId:f.agentId,status:'queued',invocationSource:'automation',contextSnapshot:{commentIds:Array.from({length:65},()=>randomUUID())}}).returning();
+  const [run]=await db.insert(heartbeatRuns).values({companyId:f.companyId,agentId:f.agentId,status:'queued',invocationSource:'automation',contextSnapshot:{commentIds:variant==='distinct'?Array.from({length:65},()=>randomUUID()):Array(66).fill(variant==='malformed'?'invalid-id':randomUUID())}}).returning();
   expect(await hasTaskExecutionLeaseAncestor(db,run)).toBe(true);
   expect(await settleOwnedInvalidTaskExecutionChild(db,run.id)).toBe(false);
   expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,run.id)))[0]).toEqual(run);

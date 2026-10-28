@@ -116,7 +116,13 @@ export async function hasTaskExecutionLeaseAncestor(db:Db,run:Run):Promise<boole
   const context=object(value);
   for(const key of keys)if(typeof context[key]==='string'&&context[key])pending.push(context[key] as string);
   for(const value of [context,object(context._paperclipWakeContext)])for(const key of ["commentId","wakeCommentId"])if(typeof value[key]==="string"&&uuid.test(value[key] as string))commentIds.add(value[key] as string);
-  for(const key of ["commentIds","wakeCommentIds"])if(Array.isArray(context[key]))for(const id of (context[key] as unknown[]).slice(0,65))if(typeof id==="string"&&uuid.test(id))commentIds.add(id);
+  for(const value of [context,object(context._paperclipWakeContext)])for(const key of ["commentIds","wakeCommentIds"]){
+   const ids=value[key];
+   if(!Array.isArray(ids))continue;
+   // Bound the raw input, before filtering or deduplication can hide omitted lineage.
+   if(ids.length>64){uncertain=true;continue;}
+   for(const id of ids)if(typeof id==="string"&&uuid.test(id))commentIds.add(id);
+  }
   const nested=object(context._paperclipWakeContext);
   for(const key of keys)if(typeof nested[key]==='string'&&nested[key])pending.push(nested[key] as string);
  };
