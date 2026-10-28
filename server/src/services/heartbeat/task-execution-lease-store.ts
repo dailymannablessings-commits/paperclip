@@ -1,10 +1,10 @@
 import {randomUUID} from 'node:crypto';
 import {and,eq,inArray,or,sql} from 'drizzle-orm';
 import type {Db} from '@paperclipai/db';
-import {activityLog,agents,agentWakeupRequests,heartbeatRuns,issues} from '@paperclipai/db';
+import {activityLog,agents,agentWakeupRequests,heartbeatRuns,issues,issueComments,nativeRunFinalizations} from '@paperclipai/db';
 import {evaluateAgentInvokabilityFromDb} from '../agent-invokability.js';
 import {conflict} from '../../errors.js';
-import {admitPausedTaskExecution,executionControlHash,canonicalHash,PAUSED_TASK_LEASE_KEY,verifyPausedTaskExecution,taskLeaseFromContext,type PausedExecutionAgent,type PausedExecutionRequest,type PausedTaskLease} from './paused-task-execution.js';
+import {admitPausedTaskExecution,canonicalHash,executionControlHash,PAUSED_TASK_LEASE_KEY,verifyPausedTaskExecution,taskLeaseFromContext,type PausedExecutionAgent,type PausedExecutionRequest,type PausedTaskLease} from './paused-task-execution.js';
 
 type Run=typeof heartbeatRuns.$inferSelect;
 function object(value:unknown):Record<string,unknown>{return value!==null&&typeof value==='object'&&!Array.isArray(value)?value as Record<string,unknown>:{};}
@@ -14,6 +14,10 @@ function controls(agent:typeof agents.$inferSelect):PausedExecutionAgent{return 
  adapterConfig:object(agent.adapterConfig),runtimeConfig:object(agent.runtimeConfig),budgetMonthlyCents:agent.budgetMonthlyCents,
  reportsTo:agent.reportsTo,permissions:object(agent.permissions),
 };}
+export function taskExecutionControlSeal(agent:typeof agents.$inferSelect){
+ const authoritative=controls(agent);
+ return {agentId:agent.id,companyId:agent.companyId,status:agent.status,expectedControlHash:executionControlHash(authoritative),expectedModel:typeof authoritative.adapterConfig.model==='string'?authoritative.adapterConfig.model:null};
+}
 export function hasTaskExecutionLease(run:Pick<Run,'contextSnapshot'>):boolean{return Object.hasOwn(object(run.contextSnapshot),PAUSED_TASK_LEASE_KEY);}
 export async function validTaskExecutionLease(db:Db,run:Run,now=new Date()):Promise<boolean>{
  try{
@@ -105,9 +109,14 @@ export async function canonicalTaskExecutionLease(db:Db,run:Run):Promise<PausedT
 export async function hasTaskExecutionLeaseAncestor(db:Db,run:Run):Promise<boolean>{
  const keys=['retryOfRunId','sourceRunId','parentRunId','predecessorRunId','goalRolloverFromRunId','livenessContinuationSourceRunId'];
  const pending:string[]=[];
+ const commentIds=new Set<string>();
+ let uncertain=false;
+ const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
  const collect=(value:unknown)=>{
   const context=object(value);
   for(const key of keys)if(typeof context[key]==='string'&&context[key])pending.push(context[key] as string);
+  for(const value of [context,object(context._paperclipWakeContext)])for(const key of ["commentId","wakeCommentId"])if(typeof value[key]==="string"&&uuid.test(value[key] as string))commentIds.add(value[key] as string);
+  for(const key of ["commentIds","wakeCommentIds"])if(Array.isArray(context[key]))for(const id of (context[key] as unknown[]).slice(0,65))if(typeof id==="string"&&uuid.test(id))commentIds.add(id);
   const nested=object(context._paperclipWakeContext);
   for(const key of keys)if(typeof nested[key]==='string'&&nested[key])pending.push(nested[key] as string);
  };
@@ -118,12 +127,20 @@ export async function hasTaskExecutionLeaseAncestor(db:Db,run:Run):Promise<boole
    const [wake]=await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.id,current.wakeupRequestId),eq(agentWakeupRequests.companyId,current.companyId),eq(agentWakeupRequests.agentId,current.agentId),eq(agentWakeupRequests.runId,current.id)));
    if(wake)collect(wake.payload);
   }
+  if(commentIds.size){
+   if(commentIds.size>64){uncertain=true;return;}
+   const comments=await db.select({sourceRunId:issueComments.createdByRunId}).from(issueComments).where(and(eq(issueComments.companyId,run.companyId),inArray(issueComments.id,[...commentIds])));
+   for(const comment of comments)if(comment.sourceRunId)pending.push(comment.sourceRunId);
+   commentIds.clear();
+  }
  };
  await inspect(run);
+ if(uncertain)return true;
  const visited=new Set<string>([run.id]);
  while(pending.length){
   const id=pending.pop()!;
   if(visited.has(id))continue;
+  if(!uuid.test(id))continue;
   // An unbounded lineage is not sufficient evidence to grant provider/tools.
   if(visited.size>=64)return true;
   visited.add(id);
@@ -131,14 +148,11 @@ export async function hasTaskExecutionLeaseAncestor(db:Db,run:Run):Promise<boole
   if(!parent)continue;
   if(hasTaskExecutionLease(parent))return true;
   await inspect(parent);
+  if(uncertain)return true;
  }
  return false;
 }
 
-export function taskExecutionControlSeal(agent:typeof agents.$inferSelect){
- const authoritative=controls(agent);
- return {agentId:agent.id,companyId:agent.companyId,status:agent.status,expectedControlHash:executionControlHash(authoritative),expectedModel:typeof authoritative.adapterConfig.model==='string'?authoritative.adapterConfig.model:null};
-}
 export async function taskExecutionLeaseBlocksAutomaticChild(db:Db,companyId:string,sourceRunId:string):Promise<boolean>{
  const [source]=await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,sourceRunId),eq(heartbeatRuns.companyId,companyId)));
  return !!source && (hasTaskExecutionLease(source)||await hasTaskExecutionLeaseAncestor(db,source));
@@ -154,12 +168,15 @@ export async function settleOwnedInvalidTaskExecutionChild(db:Db,childId:string)
  return db.transaction(async raw=>{
   const tx=raw as unknown as Db;
   await tx.select({id:agents.id}).from(agents).where(and(eq(agents.id,candidate.agentId),eq(agents.companyId,candidate.companyId))).for('update');
+  // Native replacement locks finalization before its source run. Preserve that order.
+  const [finalization]=await tx.select().from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.runId,candidate.retryOfRunId!),eq(nativeRunFinalizations.companyId,candidate.companyId))).for('update');
+  if(!finalization||finalization.phase!=='terminal_failure'||object(finalization.failureDetail).successorRunId!==childId)return false;
   const [parent]=await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,candidate.retryOfRunId!),eq(heartbeatRuns.companyId,candidate.companyId),eq(heartbeatRuns.agentId,candidate.agentId))).for('update');
   if(!parent||!['succeeded','failed','cancelled','timed_out','interrupted'].includes(parent.status)||!parent.wakeupRequestId)return false;
   await tx.select({id:agentWakeupRequests.id}).from(agentWakeupRequests).where(eq(agentWakeupRequests.id,parent.wakeupRequestId)).for('update');
-  const lease=await canonicalTaskExecutionLease(tx,parent);if(!lease)return false;
+  const lease=await canonicalTaskExecutionLease(tx,parent);if(!lease||parent.runtimeMode!=='native'||parent.nativeIssueId!==lease.issueId||finalization.issueId!==lease.issueId)return false;
   const [child]=await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,childId),eq(heartbeatRuns.companyId,parent.companyId),eq(heartbeatRuns.agentId,parent.agentId))).for('update');
-  if(!child||child.retryOfRunId!==parent.id||!['queued','scheduled_retry'].includes(child.status)||child.invocationSource!=='automation'||child.triggerDetail!=='system'||child.scheduledRetryReason!=='native_safe_replacement'||!child.wakeupRequestId||child.startedAt||child.processPid||child.processGroupId||child.processStartedAt||child.controllerBootId||child.controllerLeaseExpiresAt||child.runnerInstanceId||child.nativeSessionId)return false;
+  if(!child||child.retryOfRunId!==parent.id||!['queued','scheduled_retry'].includes(child.status)||child.invocationSource!=='automation'||child.triggerDetail!=='system'||child.scheduledRetryReason!=='native_safe_replacement'||!child.wakeupRequestId||child.startedAt||child.processPid||child.processGroupId||child.processStartedAt||child.controllerBootId||child.controllerLeaseExpiresAt||child.runnerInstanceId||child.nativeSessionId||child.externalRunId||child.driverKind||child.completionContractId||child.nativeIssueId||child.runtimeMode!=='legacy'||child.sessionIdBefore||child.sessionIdAfter||child.responsibleUserId!==parent.responsibleUserId)return false;
   const [wake]=await tx.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.id,child.wakeupRequestId),eq(agentWakeupRequests.companyId,child.companyId),eq(agentWakeupRequests.agentId,child.agentId),eq(agentWakeupRequests.runId,child.id))).for('update');
   if(!wake||wake.source!=='automation'||wake.triggerDetail!=='system'||wake.requestedByActorType!=='system'||wake.reason!=='native_safe_replacement'||wake.status!=='queued'||wake.finishedAt||wake.idempotencyKey!=='native-safe-replacement:'+parent.id||object(wake.payload).retryOfRunId!==parent.id||object(child.contextSnapshot).retryOfRunId!==parent.id||canonicalHash(taskLeaseFromContext(child.contextSnapshot))!==canonicalHash(lease)||canonicalHash(taskLeaseFromContext(wake.payload))!==canonicalHash(lease))return false;
   const now=new Date();

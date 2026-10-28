@@ -1,3 +1,4 @@
+import {hasTaskExecutionLease,hasTaskExecutionLeaseAncestor} from "../services/heartbeat/task-execution-lease-store.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
@@ -3692,6 +3693,7 @@ export function issueRoutes(
       const sourceRun = comment.createdByRunId
         ? await heartbeat.getRun(comment.createdByRunId)
         : null;
+      if(sourceRun && sourceRun.companyId===parent.companyId && (hasTaskExecutionLease(sourceRun)||await hasTaskExecutionLeaseAncestor(db,sourceRun)))return null;
       // The same lead can be working on another task. Its cross-task
       // request is not a progress or closing note from this parent run.
       if (sourceRun?.contextSnapshot?.issueId !== parent.id) return null;
@@ -14449,6 +14451,9 @@ export function issueRoutes(
           { agentId: string; wakeup: WakeupRequest }
         >();
         const addWakeup = (agentId: string, wakeup: WakeupRequest) => {
+          if(actor.actorType === "agent" && actor.runId){
+            wakeup={...wakeup,payload:{...wakeup.payload,sourceRunId:actor.runId},contextSnapshot:{...wakeup.contextSnapshot,sourceRunId:actor.runId}};
+          }
           const wakeIssueId =
             wakeup.payload &&
             typeof wakeup.payload === "object" &&
@@ -17895,6 +17900,9 @@ export function issueRoutes(
           { agentId: string; wakeup: WakeupRequest }
         >();
         const addWakeup = (agentId: string, wakeup: WakeupRequest) => {
+          if(actor.actorType === "agent" && actor.runId){
+            wakeup={...wakeup,payload:{...wakeup.payload,sourceRunId:actor.runId},contextSnapshot:{...wakeup.contextSnapshot,sourceRunId:actor.runId}};
+          }
           const wakeIssueId =
             wakeup.payload &&
             typeof wakeup.payload === "object" &&

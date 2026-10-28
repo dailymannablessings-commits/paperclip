@@ -9,6 +9,7 @@ const SOURCE_RUN_ID = "44444444-4444-4444-8444-444444444444";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
+  assertCheckoutOwner:vi.fn(async()=>({adoptedFromRunId:null})),
   getByIdentifier: vi.fn(),
   getByIdForUpdate: vi.fn(),
   update: vi.fn(),
@@ -45,6 +46,11 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
 const mockRunnerGoalService = vi.hoisted(() => ({
   projection: vi.fn(async () => null),
   act: vi.fn(),
+}));
+
+vi.mock("../services/task-watchdog-scope.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../services/task-watchdog-scope.js")>(),
+  resolveTaskWatchdogMutationScope:vi.fn(async()=>({kind:"none"})),
 }));
 
 vi.mock("../services/native-runtime/native-question-bridge.js", () => ({
@@ -201,7 +207,7 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp() {
+async function createApp(agentActor=false) {
   const [{ errorHandler }, { issueRoutes }] = await Promise.all([
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
@@ -209,7 +215,7 @@ async function createApp() {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
+    (req as any).actor = agentActor ? {type:"agent",agentId:ASSIGNEE_AGENT_ID,companyId:"company-1",runId:SOURCE_RUN_ID,source:"agent_key"} : {
       type: "board",
       userId: "local-board",
       companyIds: ["company-1"],
@@ -219,8 +225,11 @@ async function createApp() {
     };
     next();
   });
+  const runRows=()=>{const rows=Promise.resolve(mockHeartbeatService.getRun()).then(run=>run?[run]:[]);return Object.assign(rows,{for:()=>rows});};
+  const fixtureSelect=()=>({from:()=>({where:runRows})});
   app.use("/api", issueRoutes({
-    transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
+    select:fixtureSelect,
+    transaction: async (callback: (tx: Record<string, unknown>) => Promise<unknown>) => callback({select:fixtureSelect}),
   } as any, {} as any));
   app.use(errorHandler);
   return app;
@@ -938,4 +947,17 @@ describe("issue update comment wakeups", () => {
       }),
     );
   });
+  it.each(['post','patch'] as const)('preserves authenticated agent source lineage on %s mention wakes without blocking the comment',async method=>{
+    const existing=makeIssue({assigneeAgentId:ASSIGNEE_AGENT_ID,assigneeUserId:null,status:'in_progress',executionRunId:SOURCE_RUN_ID,checkoutRunId:SOURCE_RUN_ID});
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({id:'agent-lineage-comment',issueId:existing.id,companyId:existing.companyId,body:'@QA please verify',createdByRunId:SOURCE_RUN_ID,authorAgentId:ASSIGNEE_AGENT_ID});
+    mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+    mockHeartbeatService.getRun.mockResolvedValue({id:SOURCE_RUN_ID,companyId:existing.companyId,agentId:ASSIGNEE_AGENT_ID,status:'running',contextSnapshot:{issueId:existing.id}});
+    const app=await createApp(true);
+    const result=method==='post'?await request(app).post(`/api/issues/${existing.id}/comments`).send({body:'@QA please verify'}):await request(app).patch(`/api/issues/${existing.id}`).send({comment:'@QA please verify'});
+    expect(result.status,result.text).toBe(method==='post'?201:200);
+    await vi.waitFor(()=>expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(MENTIONED_AGENT_ID,expect.objectContaining({payload:expect.objectContaining({sourceRunId:SOURCE_RUN_ID}),contextSnapshot:expect.objectContaining({sourceRunId:SOURCE_RUN_ID})})));
+  });
+
 });

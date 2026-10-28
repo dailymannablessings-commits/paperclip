@@ -17050,9 +17050,9 @@ export function heartbeatService(
   }
 
   async function queuedClaimSlotAvailable(tx:Db,run:typeof heartbeatRuns.$inferSelect){
-    if(await hasTaskExecutionLeaseAncestor(tx,run))return false;
     const [current]=await tx.select().from(agents).where(and(eq(agents.id,run.agentId),eq(agents.companyId,run.companyId))).for("update");
     if(!current)return false;
+    if(await hasTaskExecutionLeaseAncestor(tx,run))return false;
     const [count]=await tx.select({total:sql<number>`count(*)::int`}).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId,run.companyId),eq(heartbeatRuns.agentId,run.agentId),eq(heartbeatRuns.status,"running"),ne(heartbeatRuns.id,run.id)));
     const running=Number(count?.total??0);
     // The lease is exclusive in both directions, including idle roles that
@@ -17068,6 +17068,7 @@ export function heartbeatService(
     companyAgents?: AgentOrgRow[],
   ) {
     if (run.status !== "queued") return run;
+    if(hasTaskExecutionLease(run)&&!await canonicalTaskExecutionLease(db,run))return null;
     if(await hasTaskExecutionLeaseAncestor(db,run)){await settleOwnedInvalidTaskExecutionChild(db,run.id);return null;}
     const agent = await getAgent(run.agentId);
     if (!agent) {
@@ -19732,6 +19733,9 @@ export function heartbeatService(
     let run = await getRun(runId);
     if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
+    // A marker is deny-only evidence until its canonical board receipt is proven.
+    if(hasTaskExecutionLease(run)&&!await canonicalTaskExecutionLease(db,run))return;
+    if(await hasTaskExecutionLeaseAncestor(db,run)){await settleOwnedInvalidTaskExecutionChild(db,run.id);return;}
 
     // Restart may reattach the already existing provider process. A lease never
     // grants another provider attempt, even if native recovery reuses its run ID.
@@ -19884,8 +19888,9 @@ export function heartbeatService(
         return;
       }
 
-      if(await hasTaskExecutionLeaseAncestor(db,run))throw new Error("bounded_task_lease_automatic_child_forbidden");
+      if(await hasTaskExecutionLeaseAncestor(db,run))return;
       if(hasTaskExecutionLease(run)){
+        if(!await canonicalTaskExecutionLease(db,run))return;
         if(!await validTaskExecutionLease(db,run)){
           await setRunStatus(run.id,"cancelled",{finishedAt:new Date(),error:"Bounded task execution authority changed before preparation",errorCode:"bounded_task_lease_invalid"});
           await setWakeupStatus(run.wakeupRequestId,"cancelled",{finishedAt:new Date()});
