@@ -598,6 +598,7 @@ describe("startServer feedback export wiring", () => {
       expect(started.server).toBe(fakeServer);
       for (const callback of callbacks) callback();
       await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(issueThreadInteractionServiceMock.sweepSupersededPendingRequestConfirmations).not.toHaveBeenCalled();
       expect(heartbeatServiceMock.recoverNativeRunsAfterRestart).not.toHaveBeenCalled();
       expect(heartbeatServiceMock.reapOrphanedRuns).not.toHaveBeenCalled();
       expect(heartbeatServiceMock.resumeQueuedRuns).not.toHaveBeenCalled();
