@@ -12,7 +12,7 @@ beforeAll(async () => { temporary = await startEmbeddedPostgresTestDatabase("man
 afterEach(async () => { for (const scheduler of schedulers.splice(0)) await scheduler.stop(); await db.delete(plugins); });
 afterAll(async () => { await temporary?.cleanup(); });
 
-async function fixture(status = "ready", jobStatus = "active") {
+async function fixture(status: (typeof plugins.$inferSelect)["status"] = "ready", jobStatus: (typeof pluginJobs.$inferSelect)["status"] = "active") {
   const pluginId = randomUUID(), jobId = randomUUID();
   await db.insert(plugins).values({ id: pluginId, pluginKey: pluginId, packageName: "synthetic", version: "1", status, manifestJson: {} as never });
   await db.insert(pluginJobs).values({ id: jobId, pluginId, jobKey: "synthetic", schedule: "* * * * *", status: jobStatus, nextRunAt: new Date("2026-01-01"), updatedAt: new Date("2026-01-01") });
@@ -25,7 +25,7 @@ async function fixture(status = "ready", jobStatus = "active") {
   return { pluginId, jobId, call, finish, scheduler, snapshot };
 }
 
-it.each(["installed", "disabled", "uninstalled", "error"])("manual execution preserves %s plugin controls and receipts despite a stale worker", async (status) => {
+it.each(["installed", "disabled", "uninstalled", "error"] as const)("manual execution preserves %s plugin controls and receipts despite a stale worker", async (status) => {
   const f = await fixture(status);
   const before = await f.snapshot();
   try {
