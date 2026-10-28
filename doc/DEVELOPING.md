@@ -1506,3 +1506,40 @@ Unavailable providers remain explicitly degraded under existing provider policy.
 Before stopping the old service, prove quiescence of plugin jobs, email/chat/tool
 delivery processors and import operations as well as heartbeat/native runs. An
 old-process heartbeat drain alone cannot establish that broader quiet window.
+
+## Reviewed verification phase boundary
+
+Release operators must run full reviewed-source verification from development
+source, after publication packaging has ended. Normal `scripts/build-npm.sh`
+intentionally materializes the publication CLI manifest/README and generated
+catalog metadata. Preserve the package artifact and its hashes first. The owner
+must then disposition only their verified generated changes; never reset an
+unknown or concurrently edited checkout. Packaging and unchanged-source testing
+are separate phases.
+
+Use the explicit operator guard inside the normal heavy/memory admission control:
+
+```sh
+node scripts/run-reviewed-verification.mjs \
+  --phase full-tests --expected-head <exact-reviewed-commit> \
+  --receipt /absolute/private/evidence/full-tests.json \
+  -- /absolute/pinned/pnpm test:run
+```
+
+Supported phase/command pairs are `full-tests` / `pnpm test:run`, `typecheck` /
+`pnpm -r typecheck`, and `build` / `pnpm build`. Ordinary developer test commands
+and uncommitted work are unaffected. The guard never restores source or changes
+the packaging contract. It refuses dirty/untracked source, wrong HEAD, unavailable
+Git evidence and materialized bytes differing from the reviewed objects (including
+hidden index flags). It checks admission and completion. Keep exclusive checkout
+ownership throughout the command; these two observations are not continuous
+monitoring or a substitute for frozen, independently owned dependencies.
+
+Receipts must be outside the checkout in existing nonsymlink directories. New
+private receipt and worktree-specific lock files use exclusive creation. Foreign
+collisions, replaced inodes and changed ownership content are preserved and fail
+closed. Evidence records phase, exact source identities, command hash and actual
+child exit; it never records raw command arguments or environment. A signal is
+incomplete, a changed completion tree is red, and zero exit alone is not a test
+verdict: review the normal complete suite selection/log and all required gates.
+The lock is per canonical worktree, allowing independent checkouts to run normally.
