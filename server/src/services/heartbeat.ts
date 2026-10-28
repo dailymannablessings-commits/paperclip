@@ -1,3 +1,4 @@
+import { getStartupTaskDrain, releaseStartupTaskDrain, startupTaskDrainConfigured } from "./startup-task-drain.js";
 import {createTaskExecutionLease,canonicalTaskExecutionLease,hasTaskExecutionLease,validTaskExecutionLease,releaseTaskExecutionLease,stripTaskExecutionLease} from "./heartbeat/task-execution-lease-store.js";
 import {PAUSED_TASK_LEASE_KEY,type PausedExecutionRequest,type PausedTaskLease} from "./heartbeat/paused-task-execution.js";
 import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
@@ -1298,6 +1299,7 @@ export function computeTaskDrain(opts: { ttlMs?: number | null } = {}): {
   startedAt: Date;
   expiresAt: Date | null;
 } {
+  if (getStartupTaskDrain()) throw conflict("Startup task drain requires explicit board stop before replacement");
   const startedAt = new Date();
   const ttlMs = opts.ttlMs ?? null;
   const expiresAt =
@@ -1323,8 +1325,9 @@ export function startTaskDrain(opts: { ttlMs?: number | null } = {}): {
 }
 
 export function stopTaskDrain(): { wasActive: boolean } {
-  const wasActive = readTaskDrain(new Date()) !== null;
+  const wasActive = readTaskDrain(new Date()) !== null || getStartupTaskDrain() !== null;
   taskDrainState = null;
+  releaseStartupTaskDrain();
   return { wasActive };
 }
 
@@ -1341,12 +1344,17 @@ export function getTaskDrainStatus(): {
   activeRuns: number;
   pendingWakes: number;
   quiescent: boolean;
+  origin: "startup" | "operator" | null;
+  rearmOnRestart: boolean;
 } {
-  const state = readTaskDrain(new Date());
+  const startup = getStartupTaskDrain();
+  const state = startup ? { startedAt: startup.startedAt, expiresAt: null } : readTaskDrain(new Date());
   const activeRuns = activeRunExecutionPromises.size;
   const pendingWakes = activeWakeupPromises.size;
   return {
     draining: state !== null,
+    origin: startup ? "startup" : state ? "operator" : null,
+    rearmOnRestart: startupTaskDrainConfigured(),
     startedAt: state?.startedAt ?? null,
     expiresAt: state?.expiresAt ?? null,
     activeRuns,
@@ -9311,7 +9319,7 @@ export function resolveHeartbeatSchedulingSuppression(
   ) {
     return { suppressed: true, reason: "database_restore_in_progress" };
   }
-  if (readTaskDrain(new Date()) !== null) {
+  if (getStartupTaskDrain() || readTaskDrain(new Date()) !== null) {
     return { suppressed: true, reason: "task_drain" };
   }
   return { suppressed: false, reason: null };

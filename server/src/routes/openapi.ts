@@ -5997,7 +5997,7 @@ registry.registerPath({
   path: "/api/instance/task-drain",
   tags: ["instance"],
   summary:
-    "Get the task-drain status for this process only; quiescent counts in-process work, and a process restart clears it even when the database still holds running rows",
+    "Get task-drain status and startup/operator origin; quiescent counts in-process work only. PAPERCLIP_STARTUP_TASK_DRAIN re-arms an indefinite hold on every restart until board stop for that process",
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
@@ -6020,7 +6020,7 @@ registry.registerPath({
   method: "delete",
   path: "/api/instance/task-drain",
   tags: ["instance"],
-  summary: "End a task drain and restore run admission",
+  summary: "Explicitly end the current process task drain and restore admission; configured startup holds re-arm on restart",
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 

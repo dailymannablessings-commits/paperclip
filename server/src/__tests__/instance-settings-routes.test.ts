@@ -997,6 +997,18 @@ describe("instance settings routes", () => {
       expect(mockPublishActivity).toHaveBeenCalledTimes(2);
     });
 
+    it("audits explicit release of a startup hold without claiming restart configuration was removed", async () => {
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue({ ...idleStatus, draining: true, origin: "startup", rearmOnRestart: true });
+      const app = await createApp(adminActor);
+      const res = await request(app).delete("/api/instance/task-drain");
+      expect(res.status).toBe(200);
+      expect(mockLogActivity).toHaveBeenCalledWith(TX_SENTINEL, expect.objectContaining({
+        action: "instance.task_drain.stopped",
+        details: { wasActive: true, origin: "startup", rearmOnRestart: true },
+      }), expect.any(Array));
+      expect(mockHeartbeatService.stopTaskDrain).toHaveBeenCalledOnce();
+    });
+
     it("does not apply a drain when the company list read fails", async () => {
       mockInstanceSettingsService.listCompanyIds.mockRejectedValue(new Error("db unavailable"));
       const app = await createApp(adminActor);

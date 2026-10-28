@@ -1,3 +1,4 @@
+import { releaseStartupTaskDrain } from "../services/startup-task-drain.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -581,6 +582,35 @@ describe("startServer feedback export wiring", () => {
       expect(reconcileSafeNativeReplacements).toHaveBeenCalledTimes(2);
     } finally {
       setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("holds every startup and periodic task producer before queue recovery under explicit startup drain", async () => {
+    const prior = process.env.PAPERCLIP_STARTUP_TASK_DRAIN;
+    process.env.PAPERCLIP_STARTUP_TASK_DRAIN = "1";
+    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true, heartbeatSchedulerIntervalMs: 30000 }));
+    const callbacks: Array<() => void> = [];
+    const intervals = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
+      callbacks.push(callback); return { unref() {} } as unknown as ReturnType<typeof setInterval>;
+    }) as typeof setInterval);
+    try {
+      const started = await startServer();
+      expect(started.server).toBe(fakeServer);
+      for (const callback of callbacks) callback();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(issueThreadInteractionServiceMock.sweepSupersededPendingRequestConfirmations).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.recoverNativeRunsAfterRestart).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.reapOrphanedRuns).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.resumeQueuedRuns).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.promoteDueScheduledRetries).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
+      expect(routineServiceMock.tickScheduledTriggers).not.toHaveBeenCalled();
+      expect(issueThreadInteractionServiceMock.sweepMergedPullRequestConfirmations).not.toHaveBeenCalled();
+      expect(reconcileSafeNativeReplacements).not.toHaveBeenCalled();
+    } finally {
+      intervals.mockRestore();
+      releaseStartupTaskDrain();
+      if (prior === undefined) delete process.env.PAPERCLIP_STARTUP_TASK_DRAIN; else process.env.PAPERCLIP_STARTUP_TASK_DRAIN = prior;
     }
   });
 

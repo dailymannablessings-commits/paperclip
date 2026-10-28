@@ -1470,3 +1470,22 @@ from stored configuration problems. Verify connection transport and endpoint
 fields before disabling a connection. Verify workspace ownership, active runs,
 Git state, and runtime-service readiness before closing a workspace. A missing
 URL or old workspace timestamp alone does not prove that a row is disposable.
+
+## Coordinated startup task drain
+
+Set `PAPERCLIP_STARTUP_TASK_DRAIN=1` in the server's actual launcher for a
+coordinated service cutover. The server arms an indefinite admission hold before
+startup recovery or background task producers. Health and board APIs remain
+available. Agent statuses, budgets, existing queues and receipts are not cleared
+or resumed by this control. Ordinary startup with the variable unset is unchanged.
+
+`GET /api/instance/task-drain` identifies `origin: "startup"` while held and
+`rearmOnRestart: true` while configured. Its `quiescent` count covers only work
+owned by this process: inspect authoritative database runs, locks and complete
+pending queues as well before stopping the old service or releasing the hold.
+After identity, control and queue-preservation verification, an authorized board
+operator explicitly releases the current process with the existing audited
+`DELETE /api/instance/task-drain`. A POST cannot replace the startup hold with a
+finite TTL. Restarting while configured re-arms it, including after a prior DELETE.
+Remove the launcher setting only in a separately coordinated verified operation.
+Never substitute a worktree or database-restore flag for this control.
