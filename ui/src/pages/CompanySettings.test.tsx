@@ -174,12 +174,15 @@ describe("CompanyEnvironments", () => {
   });
 
   afterEach(async () => {
-    await act(async () => root.unmount());
-    queryClient.clear();
-    restoreNotifications();
-    container.remove();
-    document.body.innerHTML = "";
-    vi.clearAllMocks();
+    try {
+      await act(async () => root.unmount());
+    } finally {
+      restoreNotifications();
+      queryClient.clear();
+      container.remove();
+      document.body.innerHTML = "";
+      vi.clearAllMocks();
+    }
   });
 
   it("hides sandbox creation when no run-capable sandbox provider plugins are installed", async () => {

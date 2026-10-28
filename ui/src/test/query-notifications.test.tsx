@@ -27,11 +27,14 @@ it('settles real query promise and DOM notifications through act without host-cl
     await act(async () => client.setQueryData(['controlled-notification'], 'next confirmed'));
     expect(container.textContent).toBe('next confirmed');
   } finally {
-    await act(async () => root.unmount());
-    client.clear();
-    restore();
-    container.remove();
-    vi.useRealTimers();
+    try {
+      await act(async () => root.unmount());
+    } finally {
+      restore();
+      client.clear();
+      container.remove();
+      vi.useRealTimers();
+    }
   }
 });
 

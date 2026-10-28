@@ -75,10 +75,13 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  await act(async () => root.unmount());
-  client.clear();
-  restoreNotifications();
-  container.remove();
+  try {
+    await act(async () => root.unmount());
+  } finally {
+    restoreNotifications();
+    client.clear();
+    container.remove();
+  }
 });
 
 describe("InstanceAccess company directory", () => {
