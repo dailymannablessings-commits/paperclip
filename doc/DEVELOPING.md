@@ -1498,6 +1498,14 @@ pass reads current persisted plugin/job configuration, including operator pauses
 it does not replay stale startup event payloads. Stopping a held app cancels its
 pending initialization. A replacement held process reconstructs it from the DB.
 
+Configured held boots install graceful SIGINT/SIGTERM handling before awaiting
+provider readiness. Shutdown synchronously cancels deferred startup before
+draining HTTP, re-arms the configured process hold, and lets already-entered
+initialization settle before disposing hosts, pools and the owned database
+provider. A stopped boot never advertises ready; repeated signals share one
+teardown. Require the full coordinated quiet-window proof before stopping
+either the old service or a replacement, including active foreign work.
+
 The HTTP listener and authorized board APIs are available during this phase,
 including the task-drain GET/DELETE and bounded-role control-seal GET. Health
 honestly reports `starting`/`recovering`; a configured boot becomes ready only

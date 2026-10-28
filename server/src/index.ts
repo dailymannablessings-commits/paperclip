@@ -187,6 +187,10 @@ async function endDatabaseClient(client: unknown, timeoutSeconds: number): Promi
   await sql.end({ timeout: timeoutSeconds });
 }
 
+class StartupShutdownError extends Error {
+  constructor() { super("Server startup stopped before readiness"); this.name = "StartupShutdownError"; }
+}
+
 export async function startServer(): Promise<StartedServer> {
   // Arm before any startup services, recovery or scheduler can touch queued work.
   initializeStartupTaskDrain();
@@ -194,6 +198,7 @@ export async function startServer(): Promise<StartedServer> {
   try {
     return await startServerWithDatabaseTeardown(startupDatabase);
   } catch (error) {
+    if (error instanceof StartupShutdownError) throw error;
     if (startupDatabase.close) {
       await startupDatabase.close().catch((closeError) => {
         logger.error({ err: closeError }, "failed to close database clients after startup failure");
@@ -958,6 +963,158 @@ async function startServerWithDatabaseTeardown(
   process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = JSON.stringify(runtimeApiCandidates);
   process.env.PAPERCLIP_API_URL = configuredApiUrl;
 
+  let drainHeartbeatRunsForShutdown: ((
+    signal: "SIGINT" | "SIGTERM",
+    runIds?: readonly string[] | null,
+  ) => Promise<unknown>) | null = null;
+  let drainHeartbeatExecutionFinalizers: (() => Promise<void>) | null = null;
+  let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{
+    skipDrain: boolean;
+    drainRunIds?: string[];
+  }>) | null = null;
+  let heartbeatSchedulerStopped = false;
+  let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  const heartbeatSchedulerInFlight = new Set<Promise<void>>();
+  const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
+    let tracked: Promise<void>;
+    tracked = Promise.resolve(work)
+      .then(() => undefined, () => undefined)
+      .finally(() => {
+        heartbeatSchedulerInFlight.delete(tracked);
+      });
+    heartbeatSchedulerInFlight.add(tracked);
+  };
+  const waitForHeartbeatSchedulerIdle = async () => {
+    while (heartbeatSchedulerInFlight.size > 0) {
+      await Promise.allSettled([...heartbeatSchedulerInFlight]);
+    }
+  };
+  let executionControlInterval: ReturnType<typeof setInterval> | null = null;
+  let shutdownPromise: Promise<void> | null = null;
+  let shutdownExitRequested = false;
+  let startupShutdownRequested = false;
+  const onSigint = () => shutdown("SIGINT", true);
+  const onSigterm = () => shutdown("SIGTERM", true);
+  const earlyShutdownSignals = startupTaskDrainConfigured();
+  if (earlyShutdownSignals) {
+    process.on("SIGINT", onSigint);
+    process.on("SIGTERM", onSigterm);
+  }
+
+  function shutdown(signal: "SIGINT" | "SIGTERM", exitProcess: boolean): Promise<void> {
+    shutdownExitRequested ||= exitProcess;
+    if (shutdownPromise) return shutdownPromise;
+    startupShutdownRequested = true;
+    heartbeatSchedulerStopped = true;
+    (app as { locals?: { paperclipCancelStartup?: () => void } }).locals?.paperclipCancelStartup?.();
+    // A configured process stays quiescent while owned initialization settles.
+    if (startupTaskDrainConfigured()) initializeStartupTaskDrain({ PAPERCLIP_STARTUP_TASK_DRAIN: "1" });
+    shutdownPromise = (async () => {
+    await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
+    if (executionControlInterval) { clearInterval(executionControlInterval); executionControlInterval = null; }
+    if (heartbeatSchedulerInterval) {
+      clearInterval(heartbeatSchedulerInterval);
+      heartbeatSchedulerInterval = null;
+    }
+
+    const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
+      signal,
+      prepareHotRestartShutdown,
+      waitForHeartbeatSchedulerIdle,
+    });
+    const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
+    const selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;
+    if (skipHeartbeatDrain) {
+      logger.info(
+        { signal, hotRestart: heartbeatShutdown.hotRestart },
+        "hot-restart shutdown prepared after scheduler quiescence; skipping graceful run drain",
+      );
+    } else if (heartbeatShutdown.preparationError) {
+      logger.error(
+        { err: heartbeatShutdown.preparationError, signal },
+        "hot-restart shutdown preparation failed; falling back to graceful heartbeat run drain",
+      );
+    }
+
+    const telemetryClient = getTelemetryClient();
+    if (telemetryClient) {
+      telemetryClient.stop();
+      await telemetryClient.flush();
+    }
+
+    if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
+      try {
+        const drain = await drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds);
+        logger.info({ signal, drain }, "graceful heartbeat run drain complete");
+      } catch (err) {
+        logger.error({ err, signal }, "graceful heartbeat run drain failed");
+      }
+    }
+
+    if (!skipHeartbeatDrain) {
+      await drainRunExecutionFinalizersForShutdown({
+        signal,
+        drain: drainHeartbeatExecutionFinalizers,
+        log: logger,
+      });
+    }
+
+    // Whatever the drain did not finalize (timed-out runs, the hot-restart
+    // skip path) still has a local-only tail when the in-flight run-log
+    // mirror is enabled; upload those tails now so an orderly restart
+    // never loses run output. No-op when the mirror is off.
+    try {
+      await flushInFlightRunLogMirrors();
+    } catch (err) {
+      logger.error({ err, signal }, "run-log in-flight mirror flush failed");
+    }
+
+    const appShutdown = (app as { locals?: { paperclipShutdown?: () => Promise<void> } }).locals
+      ?.paperclipShutdown;
+    const stopEmbeddedPostgres = embeddedPostgres && embeddedPostgresStartedByThisProcess
+      ? () => embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop()
+      : null;
+
+    // Await the ordered application teardown before the process exits. A live
+    // setup-token login session must stop and release its sandbox lease before
+    // the database and the provider stop, so an orderly shutdown never leaves a
+    // sandbox lease or confidential login state alive past the process exit.
+    // The HTTP listener closes first, while every service is still up, so a
+    // request in flight is drained against a working server and none reaches
+    // a route once the pool is gone; the programmatic close below then finds
+    // the listener already closed and skips.
+    await finalizeServerShutdown({
+      signal,
+      shutdownAppServices: appShutdown,
+      closeHttpListener: () =>
+        closeHttpListenerForShutdown({ server, signal, log: logger }),
+      drainPendingRunFailureReports: waitForPendingRunFailureReports,
+      closeDatabase: closeDatabaseClients,
+      stopEmbeddedPostgres,
+      shutdownInstrumentation,
+      shutdownSentry,
+      log: logger,
+    });
+
+    if (!exitProcess && server.listening) {
+      await new Promise<void>((resolveClose, rejectClose) => {
+        server.close((err) => {
+          if (err) rejectClose(err);
+          else resolveClose();
+        });
+      });
+    }
+
+    if (!shutdownExitRequested) {
+      process.removeListener("SIGINT", onSigint);
+      process.removeListener("SIGTERM", onSigterm);
+    }
+    if (shutdownExitRequested) process.exit(0);
+    })();
+    return shutdownPromise;
+  }
+
+
   let startupListenerBound = false;
   try {
   setupRunnerPrpWebSocketServer(server, { apiUrl: configuredApiUrl });
@@ -1004,6 +1161,7 @@ async function startServerWithDatabaseTeardown(
     });
   });
   startupListenerBound = true;
+  if (startupShutdownRequested) { await shutdownPromise; throw new StartupShutdownError(); }
 
   if (!getStartupTaskDrain()) {
     try {
@@ -1123,44 +1281,26 @@ async function startServerWithDatabaseTeardown(
   try {
     const bundledPluginsStartup = (app as { locals?: { bundledPluginsStartup?: Promise<unknown> } })
       .locals?.bundledPluginsStartup;
+    const managedPluginsReady = bundledPluginsStartup?.then(() => {
+      if (startupShutdownRequested) throw new StartupShutdownError();
+    });
+    // The managed helper performs mandatory metadata checks before awaiting
+    // plugins. Observe cancellation immediately, while retaining its rejection
+    // for that await, so stopping cannot create an unhandled-rejection window.
+    void managedPluginsReady?.catch(() => undefined);
     const managedEnvironmentsResult = await applyManagedEnvironments(db as any, managedConfig, {
-      pluginsReady: bundledPluginsStartup,
+      pluginsReady: managedPluginsReady,
       workerManager: pluginWorkerManager,
     });
     if (managedEnvironmentsResult) {
       logger.warn(managedEnvironmentsResult, "managed sandbox environments ensured from managed config");
     }
   } catch (err) {
+    if (startupShutdownRequested) { await shutdownPromise; throw new StartupShutdownError(); }
     logger.error({ err }, "failed to apply managed environments from managed config");
     throw err;
   }
 
-  let drainHeartbeatRunsForShutdown: ((
-    signal: "SIGINT" | "SIGTERM",
-    runIds?: readonly string[] | null,
-  ) => Promise<unknown>) | null = null;
-  let drainHeartbeatExecutionFinalizers: (() => Promise<void>) | null = null;
-  let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{
-    skipDrain: boolean;
-    drainRunIds?: string[];
-  }>) | null = null;
-  let heartbeatSchedulerStopped = false;
-  let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
-  const heartbeatSchedulerInFlight = new Set<Promise<void>>();
-  const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
-    let tracked: Promise<void>;
-    tracked = Promise.resolve(work)
-      .then(() => undefined, () => undefined)
-      .finally(() => {
-        heartbeatSchedulerInFlight.delete(tracked);
-      });
-    heartbeatSchedulerInFlight.add(tracked);
-  };
-  const waitForHeartbeatSchedulerIdle = async () => {
-    while (heartbeatSchedulerInFlight.size > 0) {
-      await Promise.allSettled([...heartbeatSchedulerInFlight]);
-    }
-  };
   const executionControlSweepsInFlight = new Set<string>();
   const executionControlSweeps = [
     ["finalization", () => reconcileAbandonedExecutionControl(db)],
@@ -1182,7 +1322,7 @@ async function startServerWithDatabaseTeardown(
         .finally(() => { executionControlSweepsInFlight.delete(queue); }));
     }
   };
-  const executionControlInterval = setInterval(sweepExecutionControl, EXECUTION_RECONCILIATION_INTERVAL_MS);
+  executionControlInterval = setInterval(sweepExecutionControl, EXECUTION_RECONCILIATION_INTERVAL_MS);
   executionControlInterval.unref?.();
   sweepExecutionControl();
   const startHeartbeatSchedulerInterval = (callback: () => void) => {
@@ -1878,6 +2018,7 @@ async function startServerWithDatabaseTeardown(
   // promise waits. Readiness must not claim plugin/provider initialization
   // completed before the owner explicitly releases the startup hold.
   if (startupTaskDrainConfigured()) await app.locals.bundledPluginsStartup;
+  if (startupShutdownRequested) { await shutdownPromise; throw new StartupShutdownError(); }
 
   setStartupRecoveryPhase("ready");
   logger.info(`Server startup recovery complete on ${config.host}:${listenPort}`);
@@ -1930,115 +2071,10 @@ async function startServerWithDatabaseTeardown(
     );
   }
   
-  const shutdown = async (
-    signal: "SIGINT" | "SIGTERM",
-    exitProcess: boolean,
-  ) => {
-    await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
-    heartbeatSchedulerStopped = true;
-    clearInterval(executionControlInterval);
-    if (heartbeatSchedulerInterval) {
-      clearInterval(heartbeatSchedulerInterval);
-      heartbeatSchedulerInterval = null;
-    }
-
-    const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
-      signal,
-      prepareHotRestartShutdown,
-      waitForHeartbeatSchedulerIdle,
-    });
-    const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
-    const selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;
-    if (skipHeartbeatDrain) {
-      logger.info(
-        { signal, hotRestart: heartbeatShutdown.hotRestart },
-        "hot-restart shutdown prepared after scheduler quiescence; skipping graceful run drain",
-      );
-    } else if (heartbeatShutdown.preparationError) {
-      logger.error(
-        { err: heartbeatShutdown.preparationError, signal },
-        "hot-restart shutdown preparation failed; falling back to graceful heartbeat run drain",
-      );
-    }
-
-    const telemetryClient = getTelemetryClient();
-    if (telemetryClient) {
-      telemetryClient.stop();
-      await telemetryClient.flush();
-    }
-
-    if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
-      try {
-        const drain = await drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds);
-        logger.info({ signal, drain }, "graceful heartbeat run drain complete");
-      } catch (err) {
-        logger.error({ err, signal }, "graceful heartbeat run drain failed");
-      }
-    }
-
-    if (!skipHeartbeatDrain) {
-      await drainRunExecutionFinalizersForShutdown({
-        signal,
-        drain: drainHeartbeatExecutionFinalizers,
-        log: logger,
-      });
-    }
-
-    // Whatever the drain did not finalize (timed-out runs, the hot-restart
-    // skip path) still has a local-only tail when the in-flight run-log
-    // mirror is enabled; upload those tails now so an orderly restart
-    // never loses run output. No-op when the mirror is off.
-    try {
-      await flushInFlightRunLogMirrors();
-    } catch (err) {
-      logger.error({ err, signal }, "run-log in-flight mirror flush failed");
-    }
-
-    const appShutdown = (app as { locals?: { paperclipShutdown?: () => Promise<void> } }).locals
-      ?.paperclipShutdown;
-    const stopEmbeddedPostgres = embeddedPostgres && embeddedPostgresStartedByThisProcess
-      ? () => embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop()
-      : null;
-
-    // Await the ordered application teardown before the process exits. A live
-    // setup-token login session must stop and release its sandbox lease before
-    // the database and the provider stop, so an orderly shutdown never leaves a
-    // sandbox lease or confidential login state alive past the process exit.
-    // The HTTP listener closes first, while every service is still up, so a
-    // request in flight is drained against a working server and none reaches
-    // a route once the pool is gone; the programmatic close below then finds
-    // the listener already closed and skips.
-    await finalizeServerShutdown({
-      signal,
-      shutdownAppServices: appShutdown,
-      closeHttpListener: () =>
-        closeHttpListenerForShutdown({ server, signal, log: logger }),
-      drainPendingRunFailureReports: waitForPendingRunFailureReports,
-      closeDatabase: closeDatabaseClients,
-      stopEmbeddedPostgres,
-      shutdownInstrumentation,
-      shutdownSentry,
-      log: logger,
-    });
-
-    if (!exitProcess && server.listening) {
-      await new Promise<void>((resolveClose, rejectClose) => {
-        server.close((err) => {
-          if (err) rejectClose(err);
-          else resolveClose();
-        });
-      });
-    }
-
-    if (exitProcess) process.exit(0);
-  };
-
-  process.once("SIGINT", () => {
-    void shutdown("SIGINT", true);
-  });
-  process.once("SIGTERM", () => {
-    void shutdown("SIGTERM", true);
-  });
+  if (!earlyShutdownSignals) {
+    process.on("SIGINT", onSigint);
+    process.on("SIGTERM", onSigterm);
+  }
 
   return {
     server,
@@ -2049,6 +2085,14 @@ async function startServerWithDatabaseTeardown(
     shutdown: (signal = "SIGTERM") => shutdown(signal, false),
   };
   } catch (error) {
+    if (startupShutdownRequested) {
+      await shutdownPromise;
+      process.removeListener("SIGINT", onSigint);
+      process.removeListener("SIGTERM", onSigterm);
+      throw new StartupShutdownError();
+    }
+    process.removeListener("SIGINT", onSigint);
+    process.removeListener("SIGTERM", onSigterm);
     if (startupListenerBound) {
       await new Promise<void>((resolveClose) => {
         try {

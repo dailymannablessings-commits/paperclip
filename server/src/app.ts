@@ -1235,11 +1235,13 @@ export async function createApp(
   // that must not outrun plugin availability — managed sandbox environments
   // (`applyManagedEnvironments`) run before the heartbeat resumes queued
   // runs — can sequence on it. It never rejects.
+  let appShuttingDown = false;
   const startupWasHeld = getStartupTaskDrain() !== null;
   const applicationStartup = deferStartupTaskDrain(async () => {
     // Construct routes while held, but do not initialize arbitrary plugin or
     // connector automation until the board explicitly releases this process.
     if (startupWasHeld) await reconcilePluginJobsAfterStartupHold({ db, scheduler, jobStore });
+    if (appShuttingDown) return;
     jobCoordinator.start();
     scheduler.start();
     feedbackExportTimer = opts.feedbackExportService
@@ -1255,6 +1257,7 @@ export async function createApp(
     importTransferSweepTimer.unref?.();
     void recoverImportTransfers();
     await toolDispatcher.initialize().catch((err) => logger.error({ err }, "Failed to initialize plugin tool dispatcher"));
+    if (appShuttingDown) return;
     // All plugin/manifest state is read at release time, never cached from the
     // held boot. A restarted process reconstructs this pass from the database.
     await ensureBundledPlugins(
@@ -1265,7 +1268,7 @@ export async function createApp(
     // Operator-DISABLED plugins are never touched in either mode.
     { reinstallUninstalled: managedAutoInstallKeys !== null },
   )
-    .then(() => loader.loadAll())
+    .then(() => appShuttingDown ? undefined : loader.loadAll())
     .then((result) => {
       if (!result) return;
       for (const loaded of result.results) {
@@ -1283,15 +1286,26 @@ export async function createApp(
   // The shutdown hook runs at most once. It caches the in-flight promise, so a
   // second caller (for example the `exit` handler) awaits the same completion
   // instead of starting a second teardown.
+  const cancelStartup = () => {
+    appShuttingDown = true;
+    applicationStartup.cancel();
+  };
+  // Cancellation is synchronous and does not dispose services used by an
+  // already-admitted HTTP request. The server invokes it before HTTP draining.
+  app.locals.paperclipCancelStartup = cancelStartup;
   let appServicesShutdown: Promise<void> | null = null;
   const shutdownAppServices = (): Promise<void> => {
     if (appServicesShutdown) return appServicesShutdown;
-    applicationStartup.cancel();
+    cancelStartup();
     appServicesShutdown = (async () => {
       // The scheduler tick queries the database. Stop it here, inside the
       // awaited teardown, so no tick runs after the caller ends the pool.
       scheduler.stop();
       jobCoordinator.stop();
+      // A released initialization may already be in flight. It must settle
+      // before hosts and their database are disposed; post-await guards above
+      // prevent that initialization from starting more services afterward.
+      await bundledPluginsStartup.catch((err) => logger.warn({ err }, "startup initialization failed while stopping; continuing service teardown"));
       disableFeedbackExportFlushes();
       unsubscribeChatPublicationSignals();
       chatReconciliation.stop();
