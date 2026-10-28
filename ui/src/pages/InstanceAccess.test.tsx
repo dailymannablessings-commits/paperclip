@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "@/api/client";
 import { CompanyProvider, useCompany } from "@/context/CompanyContext";
+import { installQueryTestNotifications } from "@/test/query-notifications";
 import { InstanceAccess } from "./InstanceAccess";
 
 const mocks = vi.hoisted(() => ({
@@ -30,6 +31,7 @@ const membershipA = {
 let container: HTMLDivElement;
 let root: Root;
 let client: QueryClient;
+let restoreNotifications: () => void;
 
 function NavigationProbe() {
   const { companies } = useCompany();
@@ -46,11 +48,9 @@ async function renderPage() {
   });
 }
 
-async function eventually(assertion: () => void) {
-  await vi.waitFor(async () => {
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
-    assertion();
-  });
+async function assertAfterReact(assertion: () => void) {
+  await act(async () => { await Promise.resolve(); });
+  assertion();
 }
 
 function button(text: string) {
@@ -58,6 +58,7 @@ function button(text: string) {
 }
 
 beforeEach(() => {
+  restoreNotifications = installQueryTestNotifications();
   vi.resetAllMocks();
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   localStorage.clear();
@@ -76,13 +77,14 @@ beforeEach(() => {
 afterEach(async () => {
   await act(async () => root.unmount());
   client.clear();
+  restoreNotifications();
   container.remove();
 });
 
 describe("InstanceAccess company directory", () => {
   it("lets admins grant access outside their navigation list and refreshes their own navigation", async () => {
     await renderPage();
-    await eventually(() => {
+    await assertAfterReact(() => {
       expect(button("Save organization access")).toBeDefined();
       expect(container.querySelector("nav")?.textContent).toBe("Company A");
     });
@@ -98,7 +100,7 @@ describe("InstanceAccess company directory", () => {
     });
     await act(async () => checkbox!.click());
     await act(async () => button("Save organization access")!.click());
-    await eventually(() => {
+    await assertAfterReact(() => {
       expect(mocks.setUserCompanyAccess).toHaveBeenCalledWith(user.id, [companyA.id, companyB.id]);
       expect(container.querySelector("nav")?.textContent).toBe("Company A, Company B");
     });
@@ -107,7 +109,7 @@ describe("InstanceAccess company directory", () => {
   it("prevents editing an incomplete directory and lets the admin retry", async () => {
     mocks.directory.mockRejectedValue(new Error("Unavailable"));
     await renderPage();
-    await eventually(() => {
+    await assertAfterReact(() => {
       expect(container.textContent).toContain("Failed to load organizations.");
       expect(container.querySelector("nav")?.textContent).toBe("Company A");
     });
@@ -115,13 +117,13 @@ describe("InstanceAccess company directory", () => {
     expect(mocks.setUserCompanyAccess).not.toHaveBeenCalled();
     mocks.directory.mockResolvedValue([companyA, companyB]);
     await act(async () => button("Try again")!.click());
-    await eventually(() => expect(button("Save organization access")).toBeDefined());
+    await assertAfterReact(() => expect(button("Save organization access")).toBeDefined());
   });
 
   it("does not request the directory when instance administration is forbidden", async () => {
     mocks.searchAdminUsers.mockRejectedValue(new ApiError("Forbidden", 403, {}));
     await renderPage();
-    await eventually(() => expect(container.textContent).toContain("Instance admin access is required"));
+    await assertAfterReact(() => expect(container.textContent).toContain("Instance admin access is required"));
     expect(mocks.directory).not.toHaveBeenCalled();
   });
 });

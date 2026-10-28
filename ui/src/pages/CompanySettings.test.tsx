@@ -1,12 +1,13 @@
 // @vitest-environment jsdom
 
-import { flushSync } from "react-dom";
-import { createRoot } from "react-dom/client";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { AGENT_ADAPTER_TYPES, getEnvironmentCapabilities } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CompanyEnvironments } from "./CompanyEnvironments";
+import { installQueryTestNotifications } from "@/test/query-notifications";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 const mockCompaniesApi = vi.hoisted(() => ({
@@ -102,33 +103,13 @@ class ResizeObserverStub {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).ResizeObserver = (globalThis as any).ResizeObserver ?? ResizeObserverStub;
 
-async function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> = undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  await result;
-}
-
 async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
+  await act(async () => { await Promise.resolve(); });
 }
 
-async function waitForAssertion(assertion: () => void) {
-  let lastError: unknown;
-  for (let i = 0; i < 20; i += 1) {
-    await flushReact();
-    try {
-      assertion();
-      return;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw lastError;
+async function assertAfterReact(assertion: () => void) {
+  await flushReact();
+  assertion();
 }
 
 const ENVIRONMENTS_PATH = "/company/settings/instance/environments";
@@ -163,10 +144,16 @@ function renderCompanyEnvironments(queryClient: QueryClient, initialPath = ENVIR
 
 describe("CompanyEnvironments", () => {
   let container: HTMLDivElement;
+  let root: Root;
+  let queryClient: QueryClient;
+  let restoreNotifications: () => void;
 
   beforeEach(() => {
+    restoreNotifications = installQueryTestNotifications();
     container = document.createElement("div");
     document.body.appendChild(container);
+    root = createRoot(container);
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({
       enableEnvironments: true,
@@ -186,17 +173,16 @@ describe("CompanyEnvironments", () => {
     });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await act(async () => root.unmount());
+    queryClient.clear();
+    restoreNotifications();
     container.remove();
     document.body.innerHTML = "";
     vi.clearAllMocks();
   });
 
   it("hides sandbox creation when no run-capable sandbox provider plugins are installed", async () => {
-    const root = createRoot(container);
-    const queryClient = new QueryClient({
-      defaultOptions: { queries: { retry: false } },
-    });
 
     await act(async () => {
       root.render(renderCompanyEnvironments(queryClient));
@@ -210,16 +196,9 @@ describe("CompanyEnvironments", () => {
     expect(container.textContent).not.toContain("Fake sandbox");
     expect(container.textContent).not.toContain("Fake is the deterministic test provider");
 
-    await act(async () => {
-      root.unmount();
-    });
   });
 
   it("omits the Local driver option and lists Sandbox before SSH", async () => {
-    const root = createRoot(container);
-    const queryClient = new QueryClient({
-      defaultOptions: { queries: { retry: false } },
-    });
     mockEnvironmentsApi.capabilities.mockResolvedValue(
       getEnvironmentCapabilities(AGENT_ADAPTER_TYPES, {
         sandboxProviders: {
@@ -249,7 +228,7 @@ describe("CompanyEnvironments", () => {
       click(addEnvironmentButton);
     });
 
-    await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeTruthy());
+    await assertAfterReact(() => expect(getEnvironmentFormPage()).toBeTruthy());
     const dialog = getEnvironmentFormPage();
 
     const driverSelect = Array.from(dialog?.querySelectorAll("select") ?? [])
@@ -262,16 +241,9 @@ describe("CompanyEnvironments", () => {
     expect(driverOptionValues).not.toContain("local");
     expect(driverOptionValues).toEqual(["sandbox", "ssh"]);
 
-    await act(async () => {
-      root.unmount();
-    });
   });
 
   it("shows the Local driver option when editing an existing local environment", async () => {
-    const root = createRoot(container);
-    const queryClient = new QueryClient({
-      defaultOptions: { queries: { retry: false } },
-    });
     mockEnvironmentsApi.list.mockResolvedValue([
       {
         id: "env-local",
@@ -300,7 +272,7 @@ describe("CompanyEnvironments", () => {
       click(editButton);
     });
 
-    await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeTruthy());
+    await assertAfterReact(() => expect(getEnvironmentFormPage()).toBeTruthy());
     const dialog = getEnvironmentFormPage();
 
     const driverSelect = Array.from(dialog?.querySelectorAll("select") ?? [])
@@ -313,16 +285,9 @@ describe("CompanyEnvironments", () => {
     expect(driverOptionValues).toContain("local");
     expect(driverSelect!.value).toBe("local");
 
-    await act(async () => {
-      root.unmount();
-    });
   });
 
   it("preserves sandbox config when re-selecting the same provider while editing", async () => {
-    const root = createRoot(container);
-    const queryClient = new QueryClient({
-      defaultOptions: { queries: { retry: false } },
-    });
     mockEnvironmentsApi.list.mockResolvedValue([
       {
         id: "env-1",
@@ -376,7 +341,7 @@ describe("CompanyEnvironments", () => {
       click(editButton);
     });
 
-    await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeTruthy());
+    await assertAfterReact(() => expect(getEnvironmentFormPage()).toBeTruthy());
     const dialog = getEnvironmentFormPage();
 
     const providerSelect = Array.from(dialog?.querySelectorAll("select") ?? []).find((select) =>
@@ -394,8 +359,5 @@ describe("CompanyEnvironments", () => {
       .find((input) => (input as HTMLInputElement).value === "saved-template") as HTMLInputElement | undefined;
     expect(templateInput?.value).toBe("saved-template");
 
-    await act(async () => {
-      root.unmount();
-    });
   });
 });
