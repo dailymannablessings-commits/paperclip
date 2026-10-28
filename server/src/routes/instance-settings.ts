@@ -386,6 +386,8 @@ export function instanceSettingsRoutes(db: Db) {
               entityId: "default",
               details: {
                 wasActive,
+                origin: priorStatus.origin ?? null,
+                rearmOnRestart: priorStatus.rearmOnRestart === true,
               },
             }, postCommitActivityPublications),
           ),
