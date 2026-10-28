@@ -34,7 +34,9 @@ function ownedFile(path, initial) {
   const identity = fstatSync(fd);
   let lastHash;
   const contentHash = () => {
-    const bytes = Buffer.alloc(fstatSync(fd).size);
+    const size = fstatSync(fd).size;
+    if (size > 65_536) throw new Error('Owned evidence content changed beyond its bounded size');
+    const bytes = Buffer.alloc(size);
     let offset = 0;
     while (offset < bytes.length) { const read = readSync(fd, bytes, offset, bytes.length - offset, offset); if (!read) throw new Error('Owned evidence truncated'); offset += read; }
     return digest(bytes);
@@ -133,10 +135,11 @@ export async function runReviewedVerification(argv) {
     process.on('SIGTERM', onTerm); process.on('SIGINT', onInt);
     const result = await new Promise((resolveChild) => {
       child = spawn(input.command[0], input.command.slice(1), { cwd: root, stdio: 'inherit', detached: true });
-      child.once('error', () => resolveChild({ code: null, signal: 'spawn_error' }));
+      child.once('error', () => resolveChild({ code: null, error: true }));
       child.once('close', (code, name) => resolveChild({ code, signal: name }));
     });
     verdict.childExitCode = result.code;
+    if (result.error) throw new Error('Verification command unavailable');
     if (signal || result.signal) { verdict.signal = signal ?? result.signal; verdict.status = 'incomplete'; }
     else {
       verdict.sourceAfter = sourceState(root, input.expected);

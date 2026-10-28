@@ -120,6 +120,11 @@ test('command failure retains its actual exit without a success claim', (t) => {
   const f = fixture(t); assert.equal(f.run('failure').status, 1); assert.equal(f.result().status, 'command_failed'); assert.equal(f.result().childExitCode, 7);
 });
 
+test('an unavailable verification executable is red, not a completed or interrupted command', (t) => {
+  const f = fixture(t); rmSync(f.pnpm);
+  assert.equal(f.run().status, 1); assert.equal(f.result().status, 'guard_failed'); assert.equal(f.result().childExitCode, null); assert.equal(existsSync(f.marker), false);
+});
+
 async function waitUntil(predicate) {
   const deadline = Date.now() + 10_000;
   while (!predicate()) { if (Date.now() > deadline) throw new Error('Fixture child did not reach its owned signal boundary'); await new Promise((resolve) => setTimeout(resolve, 10)); }
