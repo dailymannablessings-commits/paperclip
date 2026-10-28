@@ -277,6 +277,16 @@ describe('task execution lease PostgreSQL admission',()=>{
    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id,wake.id)))[0]).toMatchObject({status:'queued',runId:child.id});
   }finally{await service.drainActiveRunExecutions()}
  });
+ it.each(['retryOfRunId','sourceRunId','parentRunId','predecessorRunId','goalRolloverFromRunId'])('executes an ordinary non-leased source descendant through %s',async alias=>{
+  const f=await fixture('idle',{},'process');
+  const [parent]=await db.insert(heartbeatRuns).values({companyId:f.companyId,agentId:f.agentId,status:'succeeded',responsibleUserId:f.actorUserId,invocationSource:'automation',finishedAt:new Date(),contextSnapshot:{ordinarySource:true}}).returning();
+  const [wake]=await db.insert(agentWakeupRequests).values({companyId:f.companyId,agentId:f.agentId,source:'automation',triggerDetail:'system',reason:'synthetic-ordinary-producer',status:'queued',payload:{[alias]:parent.id},requestedByActorType:'system'}).returning();
+  const [child]=await db.insert(heartbeatRuns).values({companyId:f.companyId,agentId:f.agentId,status:'queued',responsibleUserId:f.actorUserId,invocationSource:'automation',triggerDetail:'system',wakeupRequestId:wake.id,contextSnapshot:{syntheticOrdinaryProducer:true}}).returning();
+  await db.update(agentWakeupRequests).set({runId:child.id}).where(eq(agentWakeupRequests.id,wake.id));
+  expect(await hasTaskExecutionLeaseAncestor(db,child)).toBe(false);
+  const service=heartbeatService(db,{runtimeEnv:{}});
+  try{await service.resumeQueuedRuns();await service.drainActiveRunExecutions();expect(await service.getRun(child.id)).toMatchObject({status:'succeeded',exitCode:0});}finally{await service.drainActiveRunExecutions()}
+ },20_000);
  it('denies native semantic authority to an already-running unmarked descendant of a terminal board run',async()=>{
   const f=await fixture('idle');const parent=await createTaskExecutionLease(db,f);
   await db.update(heartbeatRuns).set({status:'succeeded'}).where(eq(heartbeatRuns.id,parent.id));
