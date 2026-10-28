@@ -80,6 +80,18 @@ test('hidden assume-unchanged publication metadata is rejected by actual object 
   assert.equal(f.run().status, 1); assert.equal(existsSync(f.marker), false); assert.equal(readFileSync(join(f.repo, 'cli/package.json'), 'utf8'), 'hidden publication state');
 });
 
+test('Git replacement objects cannot substitute publication source under the reviewed HEAD identity', (t) => {
+  const f = fixture(t);
+  writeFileSync(join(f.repo, 'cli/package.json'), '{"dependencies":{"@paperclipai/server":"0.3.1"}}');
+  git(f.repo, 'add', 'cli/package.json'); git(f.repo, 'commit', '-qm', 'publication substitute');
+  const substitute = git(f.repo, 'rev-parse', 'HEAD');
+  git(f.repo, 'update-ref', 'HEAD', f.head); git(f.repo, 'replace', f.head, substitute);
+  assert.equal(git(f.repo, 'rev-parse', 'HEAD'), f.head);
+  assert.equal(git(f.repo, 'status', '--porcelain'), '');
+  assert.equal(f.run().status, 1); assert.equal(existsSync(f.marker), false);
+  assert.equal(readFileSync(join(f.repo, 'cli/package.json'), 'utf8'), '{"dependencies":{"@paperclipai/server":"0.3.1"}}');
+});
+
 test('wrong HEAD, unavailable Git evidence and missing manifests refuse execution', (t) => {
   const f = fixture(t); assert.equal(f.run('', { head: 'a'.repeat(40) }).status, 1); assert.equal(existsSync(f.marker), false);
   assert.equal(f.run('', { repo: f.evidence, receipt: join(f.evidence, 'not-git.json') }).status, 1);

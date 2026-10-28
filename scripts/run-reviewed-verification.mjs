@@ -11,7 +11,7 @@ const digest = (value) => createHash('sha256').update(value).digest('hex');
 const sameFile = (a, b) => a.dev === b.dev && a.ino === b.ino;
 
 function git(root, args) {
-  const result = spawnSync('git', ['--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-C', root, ...args], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout: 30_000 });
+  const result = spawnSync('git', ['--no-optional-locks', '--no-replace-objects', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-C', root, ...args], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout: 30_000 });
   if (result.error || result.status !== 0) throw new Error('Reviewed source Git evidence unavailable');
   return result.stdout;
 }
