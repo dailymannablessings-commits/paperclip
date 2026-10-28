@@ -340,6 +340,24 @@ export function createPluginJobScheduler(
   // Core: dispatch a single job
   // -----------------------------------------------------------------------
 
+  /** All producers share one canonical, cross-process claim boundary. */
+  async function claimJobRun(
+    jobId: string,
+    pluginId: string,
+    trigger: "schedule" | "manual" | "retry",
+  ): Promise<typeof pluginJobRuns.$inferSelect | null> {
+    return db.transaction(async (tx) => {
+      const [currentPlugin] = await tx.select().from(plugins).where(eq(plugins.id, pluginId)).for("share");
+      const [currentJob] = await tx.select().from(pluginJobs).where(and(eq(pluginJobs.id, jobId), eq(pluginJobs.pluginId, pluginId))).for("update");
+      if (getStartupTaskDrain() || currentPlugin?.status !== "ready" || currentJob?.status !== "active") return null;
+      if (trigger === "schedule" && (!currentJob.nextRunAt || currentJob.nextRunAt.getTime() > Date.now())) return null;
+      const active = await tx.select({ id: pluginJobRuns.id }).from(pluginJobRuns).where(and(eq(pluginJobRuns.jobId, jobId), eq(pluginJobRuns.pluginId, pluginId), or(eq(pluginJobRuns.status, "queued"), eq(pluginJobRuns.status, "running")))).limit(1);
+      if (active.length || !workerManager.isRunning(pluginId)) return null;
+      const [claimed] = await tx.insert(pluginJobRuns).values({ jobId, pluginId, trigger, status: "queued" }).returning();
+      return claimed;
+    });
+  }
+
   /**
    * Dispatch a single job run — create the run record, call the worker,
    * record the result, and advance the schedule pointer.
@@ -358,17 +376,7 @@ export function createPluginJobScheduler(
 
     try {
       // 1. Create run record
-      const run = await db.transaction(async (tx) => {
-        // Serialize a scheduled claim with current durable plugin controls and
-        // the job definition. A stale worker/selection grants no authority.
-        const [currentPlugin] = await tx.select().from(plugins).where(eq(plugins.id, pluginId)).for("share");
-        const [currentJob] = await tx.select().from(pluginJobs).where(and(eq(pluginJobs.id, jobId), eq(pluginJobs.pluginId, pluginId))).for("update");
-        if (getStartupTaskDrain() || currentPlugin?.status !== "ready" || currentJob?.status !== "active" || !currentJob.nextRunAt || currentJob.nextRunAt.getTime() > Date.now()) return null;
-        const active = await tx.select({ id: pluginJobRuns.id }).from(pluginJobRuns).where(and(eq(pluginJobRuns.jobId, jobId), eq(pluginJobRuns.pluginId, pluginId), or(eq(pluginJobRuns.status, "queued"), eq(pluginJobRuns.status, "running")))).limit(1);
-        if (active.length || !workerManager.isRunning(pluginId)) return null;
-        const [claimed] = await tx.insert(pluginJobRuns).values({ jobId, pluginId, trigger: "schedule", status: "queued" }).returning();
-        return claimed;
-      });
+      const run = await claimJobRun(jobId, pluginId, "schedule");
       if (!run) return;
       runId = run.id;
 
@@ -471,23 +479,6 @@ export function createPluginJobScheduler(
       );
     }
 
-    // Also check DB for running runs (defensive — covers multi-instance)
-    const existingRuns = await db
-      .select()
-      .from(pluginJobRuns)
-      .where(
-        and(
-          eq(pluginJobRuns.jobId, jobId),
-          eq(pluginJobRuns.status, "running"),
-        ),
-      );
-
-    if (existingRuns.length > 0) {
-      throw new Error(
-        `Job "${job.jobKey}" already has a running execution — cannot trigger while in progress`,
-      );
-    }
-
     // Check worker availability
     if (!workerManager.isRunning(job.pluginId)) {
       throw new Error(
@@ -496,11 +487,8 @@ export function createPluginJobScheduler(
     }
 
     // Create the run and dispatch (non-blocking)
-    const run = await jobStore.createRun({
-      jobId,
-      pluginId: job.pluginId,
-      trigger,
-    });
+    const run = await claimJobRun(jobId, job.pluginId, trigger);
+    if (!run) throw conflict(`Job "${job.jobKey}" cannot be claimed while plugin/job controls changed or another execution is queued or running`);
 
     // Dispatch in background — don't block the caller
     void dispatchManualRun(job, run.id, trigger);
