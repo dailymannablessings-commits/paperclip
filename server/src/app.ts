@@ -1305,7 +1305,7 @@ export async function createApp(
       // A released initialization may already be in flight. It must settle
       // before hosts and their database are disposed; post-await guards above
       // prevent that initialization from starting more services afterward.
-      await bundledPluginsStartup.catch((err) => logger.warn({ err }, "startup initialization failed while stopping; continuing service teardown"));
+      if (startupWasHeld) await bundledPluginsStartup.catch((err) => logger.warn({ err }, "startup initialization failed while stopping; continuing service teardown"));
       disableFeedbackExportFlushes();
       unsubscribeChatPublicationSignals();
       chatReconciliation.stop();

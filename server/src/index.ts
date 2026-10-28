@@ -993,6 +993,26 @@ async function startServerWithDatabaseTeardown(
   let shutdownPromise: Promise<void> | null = null;
   let shutdownExitRequested = false;
   let startupShutdownRequested = false;
+  let startupComplete = false;
+  // Track raw operations, never a continuation awaiting shutdown itself. This
+  // keeps admitted DB/provider work alive until it settles without a teardown cycle.
+  const startupOperations = new Set<Promise<unknown>>();
+  let backupInterval: ReturnType<typeof setInterval> | null = null;
+  const startupStep = async <T>(start: () => T | PromiseLike<T>): Promise<T> => {
+    if (startupShutdownRequested) throw new StartupShutdownError();
+    const operation = Promise.resolve().then(() => {
+      if (startupShutdownRequested) throw new StartupShutdownError();
+      return start();
+    });
+    startupOperations.add(operation);
+    let result: T;
+    try { result = await operation; } finally { startupOperations.delete(operation); }
+    if (startupShutdownRequested) throw new StartupShutdownError();
+    return result;
+  };
+  const waitForStartupOperations = async () => {
+    while (startupOperations.size > 0) await Promise.allSettled([...startupOperations]);
+  };
   const onSigint = () => shutdown("SIGINT", true);
   const onSigterm = () => shutdown("SIGTERM", true);
   const earlyShutdownSignals = startupTaskDrainConfigured();
@@ -1010,6 +1030,7 @@ async function startServerWithDatabaseTeardown(
     // A configured process stays quiescent while owned initialization settles.
     if (startupTaskDrainConfigured()) initializeStartupTaskDrain({ PAPERCLIP_STARTUP_TASK_DRAIN: "1" });
     shutdownPromise = (async () => {
+    if (backupInterval) { clearInterval(backupInterval); backupInterval = null; }
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
     if (executionControlInterval) { clearInterval(executionControlInterval); executionControlInterval = null; }
     if (heartbeatSchedulerInterval) {
@@ -1017,6 +1038,7 @@ async function startServerWithDatabaseTeardown(
       heartbeatSchedulerInterval = null;
     }
 
+    if (!startupComplete) await closeHttpListenerForShutdown({ server, signal, log: logger });
     const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
       signal,
       prepareHotRestartShutdown,
@@ -1085,7 +1107,7 @@ async function startServerWithDatabaseTeardown(
     // the listener already closed and skips.
     await finalizeServerShutdown({
       signal,
-      shutdownAppServices: appShutdown,
+      shutdownAppServices: async () => { await waitForStartupOperations(); await appShutdown?.(); },
       closeHttpListener: () =>
         closeHttpListenerForShutdown({ server, signal, log: logger }),
       drainPendingRunFailureReports: waitForPendingRunFailureReports,
@@ -1165,8 +1187,8 @@ async function startServerWithDatabaseTeardown(
 
   if (!getStartupTaskDrain()) {
     try {
-      const result = await workspaceOperationService(db as any)
-        .reconcileStaleRuntimeControlOperations();
+      const result = await startupStep(() => workspaceOperationService(db as any)
+        .reconcileStaleRuntimeControlOperations());
       if (result.reconciled > 0) {
         logger.warn(
           { reconciled: result.reconciled, operationIds: result.operationIds },
@@ -1177,7 +1199,7 @@ async function startServerWithDatabaseTeardown(
       logger.error({ err }, "startup reconciliation of managed runtime control operations failed");
     }
 
-    void reconcilePersistedRuntimeServicesOnStartup(db as any)
+    void startupStep(() => reconcilePersistedRuntimeServicesOnStartup(db as any))
       .then((result) => {
         if (
           result.reconciled > 0
@@ -1207,7 +1229,7 @@ async function startServerWithDatabaseTeardown(
     // Backfill auth.json into any already-isolated codex_local managed home that
     // was created by the #8272 isolation guard before the Phase 1 seeding fix.
     // Idempotent; the Phase 1 execute-time seeding covers new strandings.
-    void reconcileCodexLocalManagedHomesOnStartup(db)
+    void startupStep(() => reconcileCodexLocalManagedHomesOnStartup(db))
       .then((result) => {
         if (result.seeded > 0 || result.failed > 0) {
           logger.warn(
@@ -1226,7 +1248,7 @@ async function startServerWithDatabaseTeardown(
         logger.error({ err }, "startup reconciliation of codex_local managed homes failed");
       });
 
-    void reconcileBuiltInAgentsOnStartup(db as any)
+    void startupStep(() => reconcileBuiltInAgentsOnStartup(db as any))
       .then((result) => {
         if (
           result.reconciled > 0
@@ -1253,7 +1275,7 @@ async function startServerWithDatabaseTeardown(
   // PAPERCLIP_EXECUTION_MODE / PAPERCLIP_K8S_* value throws and fails startup
   // (fail-loud) rather than silently allowing local execution.
   try {
-    const policyResult = await bootstrapExecutionPolicyFromEnv(db as any);
+    const policyResult = await startupStep(() => bootstrapExecutionPolicyFromEnv(db as any));
     if (policyResult) {
       logger.warn(
         {
@@ -1288,10 +1310,10 @@ async function startServerWithDatabaseTeardown(
     // plugins. Observe cancellation immediately, while retaining its rejection
     // for that await, so stopping cannot create an unhandled-rejection window.
     void managedPluginsReady?.catch(() => undefined);
-    const managedEnvironmentsResult = await applyManagedEnvironments(db as any, managedConfig, {
+    const managedEnvironmentsResult = await startupStep(() => applyManagedEnvironments(db as any, managedConfig, {
       pluginsReady: managedPluginsReady,
       workerManager: pluginWorkerManager,
-    });
+    }));
     if (managedEnvironmentsResult) {
       logger.warn(managedEnvironmentsResult, "managed sandbox environments ensured from managed config");
     }
@@ -1322,12 +1344,14 @@ async function startServerWithDatabaseTeardown(
         .finally(() => { executionControlSweepsInFlight.delete(queue); }));
     }
   };
+  if (startupShutdownRequested) throw new StartupShutdownError();
   executionControlInterval = setInterval(sweepExecutionControl, EXECUTION_RECONCILIATION_INTERVAL_MS);
   executionControlInterval.unref?.();
   sweepExecutionControl();
   const startHeartbeatSchedulerInterval = (callback: () => void) => {
+    if (startupShutdownRequested) throw new StartupShutdownError();
     heartbeatSchedulerInterval = setInterval(() => {
-      if (!getStartupTaskDrain()) callback();
+      if (!startupShutdownRequested && !getStartupTaskDrain()) callback();
     }, config.heartbeatSchedulerIntervalMs);
     heartbeatSchedulerInterval?.unref?.();
   };
@@ -1429,16 +1453,16 @@ async function startServerWithDatabaseTeardown(
   };
 
   if (!getStartupTaskDrain()) {
-    await connectionDeliveries.sweepPending();
-    await app.locals.toolGateway.sweepActionReviews().catch((err: unknown) => logger.error({ err }, "startup tool review recovery failed"));
-    await app.locals.toolActionDeliveries.sweepPending().catch((err: unknown) => logger.error({ err }, "startup tool review delivery sweep failed"));
-    await questionResponseDeliveries.sweepPending().then((result) => {
+    await startupStep(() => connectionDeliveries.sweepPending());
+    await startupStep(() => app.locals.toolGateway.sweepActionReviews().catch((err: unknown) => logger.error({ err }, "startup tool review recovery failed")));
+    await startupStep(() => app.locals.toolActionDeliveries.sweepPending().catch((err: unknown) => logger.error({ err }, "startup tool review delivery sweep failed")));
+    await startupStep(() => questionResponseDeliveries.sweepPending().then((result) => {
       if (result.scanned > 0) {
         logger.info(result, "startup question-response delivery sweep completed");
       }
     }).catch((err) => {
       logger.error({ err }, "startup question-response delivery sweep failed");
-    });
+    }));
     scheduleGitHubConnectionEventPoll();
     scheduleGitHubConnectionContinuitySweep();
   }
@@ -1570,9 +1594,9 @@ async function startServerWithDatabaseTeardown(
         }));
     };
 
-    const worktreeRunExecutionActivation = await resolveWorktreeRunExecutionActivationState({
+    const worktreeRunExecutionActivation = await startupStep(() => resolveWorktreeRunExecutionActivationState({
       getExperimental: () => instanceSettingsService(db).getExperimental(),
-    });
+    }));
     logger.info(
       {
         state: worktreeRunExecutionActivation.armed ? "armed" : "disarmed",
@@ -1580,7 +1604,7 @@ async function startServerWithDatabaseTeardown(
       },
       "worktree run-execution cutoff state",
     );
-    const heartbeatSchedulingSuppression = await heartbeat.resolveSchedulingSuppression();
+    const heartbeatSchedulingSuppression = await startupStep(() => heartbeat.resolveSchedulingSuppression());
 
     // Reap orphaned runs before timer ticks start so wakeups cannot coalesce
     // into a dead "running" row during startup recovery.
@@ -1593,10 +1617,10 @@ async function startServerWithDatabaseTeardown(
       const startupHeartbeatRecovery = (async () => {
         // Legacy remote recovery releases sandbox leases. Wait for provider
         // workers before cleanup or retry admission, including unmanaged installs.
-        await app.locals.bundledPluginsStartup;
+        await startupStep(() => app.locals.bundledPluginsStartup);
         try {
           const nativeRecovery =
-            await heartbeat.recoverNativeRunsAfterRestart();
+            await startupStep(() => heartbeat.recoverNativeRunsAfterRestart());
           if (nativeRecovery.dispositions.length > 0) {
             logger.info(
               {
@@ -1621,7 +1645,7 @@ async function startServerWithDatabaseTeardown(
           throw err;
         }
         try {
-          const hotRestart = await heartbeat.reconcileHotRestartAdoption();
+          const hotRestart = await startupStep(() => heartbeat.reconcileHotRestartAdoption());
           if (hotRestart.mode === "reported") {
             logger.info(
               hotRestart,
@@ -1637,7 +1661,7 @@ async function startServerWithDatabaseTeardown(
 
         for (let attempt = 1; attempt <= 2; attempt++) {
           try {
-            const result = await heartbeat.reapOrphanedRuns();
+            const result = await startupStep(() => heartbeat.reapOrphanedRuns());
             logger.info(
               { reaped: result.reaped, runIds: result.runIds },
               "startup reap of orphaned heartbeat runs complete",
@@ -1655,9 +1679,9 @@ async function startServerWithDatabaseTeardown(
           }
         }
 
-        const promotion = await heartbeat.promoteDueScheduledRetries();
-        await heartbeat.resumeQueuedRuns();
-        const recoveredGoalActions = await heartbeat.recoverPendingSessionGoalActions();
+        const promotion = await startupStep(() => heartbeat.promoteDueScheduledRetries());
+        await startupStep(() => heartbeat.resumeQueuedRuns());
+        const recoveredGoalActions = await startupStep(() => heartbeat.recoverPendingSessionGoalActions());
         if (
           recoveredGoalActions.enqueued > 0 ||
           recoveredGoalActions.invalid > 0
@@ -1667,14 +1691,14 @@ async function startServerWithDatabaseTeardown(
             "startup session-goal action outbox recovery reconciled pending controls",
           );
         }
-        const recoveredGoals = await heartbeat.recoverActiveSessionGoals();
+        const recoveredGoals = await startupStep(() => heartbeat.recoverActiveSessionGoals());
         if (recoveredGoals.enqueued > 0) {
           logger.warn(
             recoveredGoals,
             "startup session-goal recovery resumed durable agent goals",
           );
         }
-        const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+        const reconciled = await startupStep(() => heartbeat.reconcileStrandedAssignedIssues());
         if (
           promotion.promoted > 0 ||
           reconciled.assignmentDispatched > 0 ||
@@ -1689,7 +1713,7 @@ async function startServerWithDatabaseTeardown(
           );
         }
 
-        const dependencyWakesReconciled = await heartbeat.reconcileResolvedDependencyWakes();
+        const dependencyWakesReconciled = await startupStep(() => heartbeat.reconcileResolvedDependencyWakes());
         if (dependencyWakesReconciled.healed > 0) {
           logger.warn(
             { ...dependencyWakesReconciled },
@@ -1697,7 +1721,7 @@ async function startServerWithDatabaseTeardown(
           );
         }
 
-        const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
+        const taskWatchdogsReconciled = await startupStep(() => heartbeat.reconcileTaskWatchdogs());
         if (taskWatchdogsReconciled.triggered > 0) {
           logger.warn(
             { ...taskWatchdogsReconciled },
@@ -1705,12 +1729,12 @@ async function startServerWithDatabaseTeardown(
           );
         }
 
-        const scanned = await heartbeat.scanSilentActiveRuns();
+        const scanned = await startupStep(() => heartbeat.scanSilentActiveRuns());
         if (scanned.created > 0 || scanned.escalated > 0) {
           logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
         }
 
-        const swept = await heartbeat.sweepStaleIssueLocks();
+        const swept = await startupStep(() => heartbeat.sweepStaleIssueLocks());
         if (swept.cleared > 0) {
           logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
         }
@@ -1719,63 +1743,63 @@ async function startServerWithDatabaseTeardown(
         throw err;
       });
       trackHeartbeatSchedulerWork(startupHeartbeatRecovery);
-      await startupHeartbeatRecovery;
+      await startupStep(() => startupHeartbeatRecovery);
     }
 
     if (!getStartupTaskDrain()) {
-      const setupCleanup = await environmentCustomImages.cleanupExpiredSetupSessions();
+      const setupCleanup = await startupStep(() => environmentCustomImages.cleanupExpiredSetupSessions());
       if (setupCleanup.timedOut > 0 || setupCleanup.failed > 0) {
         logger.warn({ ...setupCleanup }, "startup environment customImage setup cleanup changed sessions");
       }
 
-      const toolHealthSweep = await tools.sweepConnectionHealth();
+      const toolHealthSweep = await startupStep(() => tools.sweepConnectionHealth());
       if (toolHealthSweep.failed > 0) {
         logger.warn({ ...toolHealthSweep }, "startup tool connection health sweep found failing connections");
       }
-      await decisionExecutor.sweepExpired();
+      await startupStep(() => decisionExecutor.sweepExpired());
 
       // Run the adapter login reaper once at startup, so a login sandbox that
       // outlived a server restart is deleted before timer ticks start.
-      await adapterLoginReaper
+      await startupStep(() => adapterLoginReaper
         .sweep()
         .then(logAdapterLoginReaperResult)
         .catch((err) => {
           logger.error({ err }, "startup adapter login reaper sweep failed");
-        });
+        }));
 
       // Run the setup-token login reaper once at startup, so a login sandbox lease
       // that outlived a server restart releases before timer ticks start.
-      await setupTokenReaper
+      await startupStep(() => setupTokenReaper
         .sweep()
         .then(logSetupTokenReaperResult)
         .catch((err) => {
           logger.error({ err }, "startup setup-token login reaper sweep failed");
-        });
+        }));
 
       // Retry any orphan sandbox teardown left by a failed acquire before a server
       // restart, so a leaked sandbox does not stay allocated across the restart.
-      await runEnvironmentLeaseCleanupSweep(0);
+      await startupStep(() => runEnvironmentLeaseCleanupSweep(0));
 
     }
 
     const runRetentionSweep = async () => {
-      const activeCompanies = await db.select({ id: companies.id }).from(companies).where(eq(companies.status, "active"));
+      const activeCompanies = await startupStep(() => db.select({ id: companies.id }).from(companies).where(eq(companies.status, "active")));
       let archived = 0;
       for (const company of activeCompanies) {
         // Cursor pagination rebuilds the whole feed for every page; one
         // unscoped all-items build keeps this sweep at a single feed build
         // per company per tick.
-        const page = await attentionService(db as any).list(company.id, {
+        const page = await startupStep(() => attentionService(db as any).list(company.id, {
           includeDismissed: true,
           all: true,
           allowUnscopedAll: true,
-        });
-        archived += await retentionExecutor.autoArchive({ companyId: company.id, items: page.items });
+        }));
+        archived += await startupStep(() => retentionExecutor.autoArchive({ companyId: company.id, items: page.items }));
       }
-      const notifications = await retentionExecutor.deliverNotifications();
+      const notifications = await startupStep(() => retentionExecutor.deliverNotifications());
       return { archived, ...notifications };
     };
-    if (!getStartupTaskDrain()) await runRetentionSweep();
+    if (!getStartupTaskDrain()) await startupStep(() => runRetentionSweep());
 
     startHeartbeatSchedulerInterval(() => {
       // Track the outer async callback as well as the work it starts. Shutdown
@@ -1969,7 +1993,7 @@ async function startServerWithDatabaseTeardown(
     // is still required. A failed acquire can leak a paid provider sandbox, so
     // this path retries the teardown at startup and on the interval, exactly as
     // the enabled path does.
-    if (!getStartupTaskDrain()) await runEnvironmentLeaseCleanupSweep(0);
+    if (!getStartupTaskDrain()) await startupStep(() => runEnvironmentLeaseCleanupSweep(0));
     startHeartbeatSchedulerInterval(() => {
       scheduleExternalObjectRefreshSweep(new Date());
       scheduleEnvironmentLeaseCleanupSweep();
@@ -1978,7 +2002,7 @@ async function startServerWithDatabaseTeardown(
     });
   }
   
-  if (config.databaseBackupEnabled) {
+  if (!startupShutdownRequested && config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
 
     logger.info(
@@ -1989,7 +2013,8 @@ async function startServerWithDatabaseTeardown(
       },
       "Automatic database backups enabled",
     );
-    setInterval(() => {
+    backupInterval = setInterval(() => {
+      if (startupShutdownRequested || getStartupTaskDrain()) return;
       void runServerDatabaseBackup("scheduled").catch(() => {
         // runServerDatabaseBackup already logs the failure with context.
       });
@@ -1999,8 +2024,8 @@ async function startServerWithDatabaseTeardown(
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.
-  const { waitForExternalAdapters } = await import("./adapters/registry.js");
-  await waitForExternalAdapters();
+  const { waitForExternalAdapters } = await startupStep(() => import("./adapters/registry.js"));
+  await startupStep(() => waitForExternalAdapters());
 
   // Reconcile the agent-creation picker to the declaratively-configured adapter
   // set (PAPERCLIP_ADAPTERS). Must run after external adapters are loaded so the
@@ -2017,9 +2042,10 @@ async function startServerWithDatabaseTeardown(
   // A configured held boot exposes the bound board/health APIs while this
   // promise waits. Readiness must not claim plugin/provider initialization
   // completed before the owner explicitly releases the startup hold.
-  if (startupTaskDrainConfigured()) await app.locals.bundledPluginsStartup;
+  if (startupTaskDrainConfigured()) await startupStep(() => app.locals.bundledPluginsStartup);
   if (startupShutdownRequested) { await shutdownPromise; throw new StartupShutdownError(); }
 
+  startupComplete = true;
   setStartupRecoveryPhase("ready");
   logger.info(`Server startup recovery complete on ${config.host}:${listenPort}`);
   void systemdNotify(["--ready", `--status=Listening on ${config.host}:${listenPort}`]).then((notified) => {

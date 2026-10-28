@@ -1501,8 +1501,10 @@ pending initialization. A replacement held process reconstructs it from the DB.
 Configured held boots install graceful SIGINT/SIGTERM handling before awaiting
 provider readiness. Shutdown synchronously cancels deferred startup before
 draining HTTP, re-arms the configured process hold, and lets already-entered
-initialization settle before disposing hosts, pools and the owned database
-provider. A stopped boot never advertises ready; repeated signals share one
+initialization and admitted startup database operations settle before disposing
+hosts, pools and the owned database provider. Every admitted startup phase checks
+cancellation before the next phase; detached reconciliations are tracked too.
+Ordinary unconfigured shutdown does not wait on an unfinished plugin initializer. A stopped boot never advertises ready; repeated signals share one
 teardown. Require the full coordinated quiet-window proof before stopping
 either the old service or a replacement, including active foreign work.
 
