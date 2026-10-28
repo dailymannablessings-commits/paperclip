@@ -25,12 +25,12 @@ vi.mock("../services/bundled-plugins.js", async (original) => ({ ...await origin
 vi.mock("../app.js", async (original) => {
   const mod = await original<typeof import("../app.js")>();
   return { ...mod, createApp: async (...args: Parameters<typeof mod.createApp>) => {
-    const app = await mod.createApp(...args); appEvidence.app = app; appEvidence.db = args[0]; return app;
+    const app = await mod.createApp(...args); releaseStartupTaskDrain(); appEvidence.app = app; appEvidence.db = args[0]; return app;
   } };
 });
 import { startServer, type StartedServer } from "../index.js";
 import { getStartupRecoveryState } from "../startup-recovery-state.js";
-import { getStartupTaskDrain } from "../services/startup-task-drain.js";
+import { getStartupTaskDrain, releaseStartupTaskDrain } from "../services/startup-task-drain.js";
 import { stopTaskDrain } from "../services/heartbeat.js";
 
 let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -57,7 +57,7 @@ beforeAll(async () => {
   const listener = createServer(); await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
   port = (listener.address() as { port: number }).port;
   await new Promise<void>((resolve) => listener.close(() => resolve()));
-  Object.assign(process.env, { PAPERCLIP_HOME: folder, PAPERCLIP_INSTANCE_ID: "synthetic-startup-hold", PAPERCLIP_STARTUP_TASK_DRAIN: "0", PAPERCLIP_SECRETS_MASTER_KEY_FILE: join(folder, "master.key"), PAPERCLIP_DECISION_SIGNING_SECRET: "a".repeat(64), PAPERCLIP_AGENT_JWT_SECRET: "b".repeat(64), PAPERCLIP_OPEN_ON_LISTEN: "false", PAPERCLIP_MANAGED_CONFIG: JSON.stringify({ v: 1, mode: "cloud", catalogVersion: "fixture", features: {}, plugins: { autoInstall: ["kubernetes"] }, environments: [{ name: "Declared fixture provider", provider: "kubernetes", config: {} }] }) });
+  Object.assign(process.env, { PAPERCLIP_HOME: folder, PAPERCLIP_INSTANCE_ID: "synthetic-startup-hold", PAPERCLIP_STARTUP_TASK_DRAIN: "1", PAPERCLIP_SECRETS_MASTER_KEY_FILE: join(folder, "master.key"), PAPERCLIP_DECISION_SIGNING_SECRET: "a".repeat(64), PAPERCLIP_AGENT_JWT_SECRET: "b".repeat(64), PAPERCLIP_OPEN_ON_LISTEN: "false", PAPERCLIP_MANAGED_CONFIG: JSON.stringify({ v: 1, mode: "cloud", catalogVersion: "fixture", features: {}, plugins: { autoInstall: ["kubernetes"] }, environments: [{ name: "Declared fixture provider", provider: "kubernetes", config: {} }] }) });
   config.value = { deploymentMode: "local_trusted", deploymentExposure: "private", bind: "loopback", host: "127.0.0.1", port, allowedHostnames: [], authBaseUrlMode: "auto", databaseMode: "postgres", databaseUrl: database.connectionString, embeddedPostgresPort: 54329, embeddedPostgresDataDir: join(folder, "unused"), databaseBackupEnabled: false, databaseBackupIntervalMinutes: 60, databaseBackupRetentionDays: 30, databaseBackupDir: join(folder, "backups"), serveUi: false, uiDevMiddleware: false, secretsProvider: "local_encrypted", secretsStrictMode: false, secretsMasterKeyFilePath: join(folder, "master.key"), storageProvider: "local_disk", storageLocalDiskBaseDir: join(folder, "storage"), heartbeatSchedulerEnabled: false, heartbeatSchedulerIntervalMs: 30000, telemetryEnabled: false, companyDeletionEnabled: false };
 }, 60_000);
 
@@ -72,7 +72,7 @@ afterAll(async () => {
   rmSync(folder, { recursive: true, force: true });
 }, 60_000);
 
-it("preserves admitted detached startup work before disposing runtime resources", async () => {
+it("preserves admitted detached configured-startup work before disposing runtime resources", async () => {
   const before = new Set(process.listeners("SIGTERM"));
   const blocked = new Promise<void>(resolve => { phaseEvidence.finish = resolve; });
   phaseEvidence.wait = () => blocked;

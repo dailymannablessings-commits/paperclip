@@ -1004,7 +1004,7 @@ async function startServerWithDatabaseTeardown(
       if (startupShutdownRequested) throw new StartupShutdownError();
       return start();
     });
-    startupOperations.add(operation);
+    if (startupTaskDrainConfigured()) startupOperations.add(operation);
     let result: T;
     try { result = await operation; } finally { startupOperations.delete(operation); }
     if (startupShutdownRequested) throw new StartupShutdownError();
@@ -1473,12 +1473,19 @@ async function startServerWithDatabaseTeardown(
     const retentionExecutor = decisionRetentionService(db as any, {
       notifyOriginAgent: createDecisionRetentionNotifyOriginAgent(heartbeat.wakeup),
     });
+    let ownedShutdownRunIds: string[] = [];
     drainHeartbeatRunsForShutdown = (signal, runIds) => (
-      heartbeat.drainRunningRunsForShutdown(signal, new Date(), runIds)
+      heartbeat.drainRunningRunsForShutdown(signal, new Date(), startupTaskDrainConfigured()
+        ? ownedShutdownRunIds.filter((id) => !runIds || runIds.includes(id)) : runIds,
+      startupTaskDrainConfigured())
     );
     drainHeartbeatExecutionFinalizers = () =>
       heartbeat.drainActiveRunExecutions();
-    prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
+    prepareHotRestartShutdown = startupTaskDrainConfigured() ? async (signal) => {
+      await waitForStartupOperations();
+      ownedShutdownRunIds = await heartbeat.claimOwnedShutdownRunIds();
+      return heartbeat.prepareHotRestartShutdown(signal, new Date(), ownedShutdownRunIds, true);
+    } : heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
     const statusCards = statusCardService(db as any);

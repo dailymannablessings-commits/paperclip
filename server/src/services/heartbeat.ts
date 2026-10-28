@@ -202,6 +202,7 @@ import {
   closeWarmNativeSessionsForEnvironment,
   closeIdleWarmNativeSessionsForRestart,
   currentNativeControllerIdentity,
+  renewNativeSessionExecutionLease,
   dispatchNativeSessionResumptions,
   detachNativeSessionsForRestart,
   ensureNativeCompletionContract,
@@ -14303,11 +14304,49 @@ export function heartbeatService(
     );
   }
 
+  // A configured replacement must never adopt DB-global shutdown authority.
+  // Process-local execution evidence is necessary; a fresh canonical lease CAS
+  // is also required, since ownership may have transferred since dispatch.
+  async function claimOwnedShutdownRunIds(requested?: readonly string[]) {
+    const candidates = [...activeRunExecutions].filter((id) => !requested || requested.includes(id));
+    const owned: string[] = [];
+    for (const id of candidates) {
+      const run = await getRun(id);
+      if (!run || run.status !== "running" || !activeRunExecutions.has(id)) continue;
+      if (run.runtimeMode === "legacy") {
+        if (await renewLegacyControllerLease(db, run)) owned.push(id);
+        continue;
+      }
+      if (run.runtimeMode !== "native" || !run.nativeIssueId) continue;
+      const coordinator = await db.select().from(nativeRunFinalizations)
+        .where(and(eq(nativeRunFinalizations.runId, id), eq(nativeRunFinalizations.companyId, run.companyId),
+          eq(nativeRunFinalizations.issueId, run.nativeIssueId)))
+        .then((rows) => rows[0] ?? null);
+      if (!coordinator?.leaseOwner || coordinator.resultId) continue;
+      try {
+        await renewNativeSessionExecutionLease({ db, runId: id, companyId: run.companyId,
+          issueId: run.nativeIssueId, leaseOwner: coordinator.leaseOwner, attempt: coordinator.attempt });
+        owned.push(id);
+      } catch (error) {
+        if (!(error instanceof Error) || error.message !== "native_session_lease_lost") throw error;
+      }
+    }
+    return owned;
+  }
+
   async function prepareHotRestartShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
+    runIds: readonly string[] | null = null,
+    requireOwnedExecution = false,
   ) {
     shutdownInProgress = true;
+    const selectedRunIds = requireOwnedExecution
+      ? await claimOwnedShutdownRunIds(runIds ?? [])
+      : runIds ? [...new Set(runIds)] : null;
+    if (selectedRunIds?.length === 0) return {
+      mode: "no_owned_runs" as const, skipDrain: true as const, activeRunIds: [] as string[],
+    };
     const idleSessions = await closeIdleWarmNativeSessionsForRestart();
     if (idleSessions.failed > 0) {
       logger.warn({ idleSessions }, "idle native sessions could not checkpoint before controller shutdown");
@@ -14359,7 +14398,7 @@ export function heartbeatService(
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-      .where(eq(heartbeatRuns.status, "running"));
+      .where(selectedRunIds ? and(eq(heartbeatRuns.status, "running"), inArray(heartbeatRuns.id, selectedRunIds)) : eq(heartbeatRuns.status, "running"));
     const snapshotRuns = activeRuns.map(toHotRestartIntentRun);
     const intentWithVersion = {
       ...intent,
@@ -14901,8 +14940,11 @@ export function heartbeatService(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
     runIds: readonly string[] | null = null,
+    requireOwnedExecution = false,
   ) {
-    const selectedRunIds = runIds ? [...new Set(runIds)] : null;
+    const selectedRunIds = requireOwnedExecution
+      ? await claimOwnedShutdownRunIds(runIds ?? [])
+      : runIds ? [...new Set(runIds)] : null;
     if (selectedRunIds?.length === 0) {
       return {
         interrupted: 0,
@@ -14932,6 +14974,7 @@ export function heartbeatService(
     const restartSuspendedRunIds: string[] = [];
 
     for (const { run, agent } of activeRuns) {
+      if (requireOwnedExecution && !(await claimOwnedShutdownRunIds([run.id])).includes(run.id)) continue;
       // Shutdown owns only this boot's legacy executions. Expired foreign
       // owners belong to the reaper, not another container's drain.
       if (run.runtimeMode === "legacy" && run.controllerBootId &&
@@ -29140,6 +29183,7 @@ export function heartbeatService(
 
     reportRunActivity: clearDetachedRunWarning,
 
+    claimOwnedShutdownRunIds,
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     recoverNativeRunsAfterRestart,
