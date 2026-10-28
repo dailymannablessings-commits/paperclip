@@ -1,3 +1,5 @@
+import { initializeStartupTaskDrain } from "../services/startup-task-drain.js";
+import { stopTaskDrain } from "../services/heartbeat.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments, annotateConnectorSkills } from "../services/connector-runtime.js";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
 import { renderPaperclipWakePrompt, resolvePaperclipDesiredSkillNames, resolveLegacyPaperclipDesiredSkillNames } from "@paperclipai/adapter-utils/server-utils";
@@ -90,6 +92,7 @@ describe("AgentMail durable email pipeline", () => {
     });
   }, 60_000);
   afterEach(async () => {
+    stopTaskDrain();
     for (const service of services.splice(0)) await service.shutdown();
     vi.restoreAllMocks();
     await db
@@ -371,6 +374,22 @@ describe("AgentMail durable email pipeline", () => {
       setWebhookError: (status: number) => { webhookError = status; },
     };
   }
+  it("retains incoming email receipts without automatic delivery under startup hold, then processes after explicit release", async () => {
+    const f = await fixture();
+    initializeStartupTaskDrain({ PAPERCLIP_STARTUP_TASK_DRAIN: "1" });
+    const message = f.message();
+    f.messages.set(message.message_id, message);
+    await f.service.admit(await f.service.getEndpoint(f.endpointId), { event_type: "message.received", message });
+    const snapshot = async () => ({ deliveries: await db.select().from(chatDeliveries).where(eq(chatDeliveries.companyId, f.companyId)), publications: await db.select().from(chatPublications).where(eq(chatPublications.companyId, f.companyId)), tasks: await db.select().from(issues).where(eq(issues.companyId, f.companyId)) });
+    const before = await snapshot();
+    expect(before.deliveries).toHaveLength(1);
+    await f.service.tick();
+    expect(await snapshot()).toEqual(before);
+    expect(f.wakeup).not.toHaveBeenCalled();
+    stopTaskDrain();
+    await f.service.tick();
+    expect(f.wakeup).toHaveBeenCalledOnce();
+  });
   it("admits signed webhooks through the durable queue and rejects a valid signature for another inbox", async () => {
     const f = await fixture();
     const endpoint = await f.service.getEndpoint(f.endpointId);

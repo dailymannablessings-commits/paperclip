@@ -1,3 +1,4 @@
+import { getStartupTaskDrain, deferStartupTaskDrain } from "./services/startup-task-drain.js";
 import { aiConnectionRoutes } from "./routes/ai-connections.js";
 import { projectToolRoutes } from "./routes/project-tools.js";
 import { emailChannelService } from "./services/email-channels.js";
@@ -154,7 +155,7 @@ import {
 import { subscribeAllCompanyLiveEvents } from "./services/live-events.js";
 import { heartbeatService } from "./services/heartbeat.js";
 import { pluginLifecycleManager } from "./services/plugin-lifecycle.js";
-import { createPluginJobCoordinator } from "./services/plugin-job-coordinator.js";
+import { createPluginJobCoordinator, reconcilePluginJobsAfterStartupHold } from "./services/plugin-job-coordinator.js";
 import {
   buildHostServices,
   flushPluginLogBuffer,
@@ -326,7 +327,7 @@ export function createChatReconciliationCoordinator(input: {
   };
   return {
     reconcile() {
-      if (stopped) return;
+      if (stopped || getStartupTaskDrain()) return;
       start("provider runtimes", input.reconcileProviderRuntimes);
       start("deliveries", input.processPendingDeliveries);
       if (input.processFailedGitHubWebhookDeliveries) {
@@ -341,6 +342,7 @@ export function createChatReconciliationCoordinator(input: {
       start("Slack session status", input.processPendingSlackSessionSyncs);
     },
     notifyPublications() {
+      if (stopped || getStartupTaskDrain()) return;
       milestoneReconciliation.notify();
       publicationReconciliation.notify();
     },
@@ -1100,8 +1102,6 @@ export async function createApp(
 
   app.use(errorHandler);
 
-  jobCoordinator.start();
-  scheduler.start();
   let feedbackExportShuttingDown = false;
   let feedbackExportTimer: ReturnType<typeof setInterval> | null = null;
   const disableFeedbackExportFlushes = () => {
@@ -1112,7 +1112,7 @@ export async function createApp(
     }
   };
   const flushPendingFeedbackExports = async () => {
-    if (feedbackExportShuttingDown) return;
+    if (feedbackExportShuttingDown || getStartupTaskDrain()) return;
     try {
       await opts.feedbackExportService?.flushPendingFeedbackTraces();
     } catch (err) {
@@ -1128,16 +1128,6 @@ export async function createApp(
     }
   };
 
-  feedbackExportTimer = opts.feedbackExportService
-    ? setInterval(() => {
-        void flushPendingFeedbackExports();
-      }, FEEDBACK_EXPORT_FLUSH_INTERVAL_MS)
-    : null;
-  feedbackExportTimer?.unref?.();
-  if (opts.feedbackExportService) {
-    void flushPendingFeedbackExports();
-  }
-  emailChannels.start();
   const flushChatPublications = async () => {
     await chatChannels.schedulePendingPublications();
   };
@@ -1165,20 +1155,14 @@ export async function createApp(
         chatReconciliation.notifyPublications();
     },
   );
-  let chatPublicationTimer: ReturnType<typeof setInterval> | null = setInterval(
-    () => {
-      chatReconciliation.reconcile();
-    },
-    CHAT_PUBLICATION_FLUSH_INTERVAL_MS,
-  );
-  chatPublicationTimer.unref?.();
-  chatReconciliation.reconcile();
+  let chatPublicationTimer: ReturnType<typeof setInterval> | null = null;
   // Abandoned chunked-import spool sweep: hourly (plus once at startup),
   // deleting spool dirs whose transfer saw no activity for 24h and cancelling
   // their still-open ledger runs. Same setInterval + unref + shutdown-clear
   // shape as the feedback export flush above.
   const importTransferSpoolRoot = resolveDefaultImportTransferSpoolRoot();
   const sweepImportTransferSpools = () => {
+    if (getStartupTaskDrain()) return;
     sweepAbandonedImportTransferSpools(db, importTransferSpoolRoot)
       .then((result) => {
         if (result.swept > 0) {
@@ -1192,18 +1176,13 @@ export async function createApp(
         );
       });
   };
-  let importTransferSweepTimer: ReturnType<typeof setInterval> | null =
-    setInterval(
-      sweepImportTransferSpools,
-      IMPORT_TRANSFER_SPOOL_SWEEP_INTERVAL_MS,
-    );
-  importTransferSweepTimer.unref?.();
+  let importTransferSweepTimer: ReturnType<typeof setInterval> | null = null;
   // Startup only (never on the hourly interval — that would kill live
   // applies): apply jobs are in-memory in this single process, so any run
   // still "applying" now was interrupted by the previous shutdown and would
   // otherwise 409 every retry forever. Fail those stranded runs — their
   // spooled parts stay reusable — then run the normal sweep once.
-  void companyTransferRunService
+  const recoverImportTransfers = () => companyTransferRunService
     .recoverStrandedApplyingRuns(db)
     .then((recovered) => {
       if (recovered.length > 0) {
@@ -1219,9 +1198,6 @@ export async function createApp(
     .finally(() => {
       sweepImportTransferSpools();
     });
-  void toolDispatcher.initialize().catch((err) => {
-    logger.error({ err }, "Failed to initialize plugin tool dispatcher");
-  });
   const devWatcher = createPluginDevWatcher(
     lifecycle,
     async (pluginId) =>
@@ -1259,7 +1235,29 @@ export async function createApp(
   // that must not outrun plugin availability — managed sandbox environments
   // (`applyManagedEnvironments`) run before the heartbeat resumes queued
   // runs — can sequence on it. It never rejects.
-  const bundledPluginsStartup = ensureBundledPlugins(
+  const startupWasHeld = getStartupTaskDrain() !== null;
+  const applicationStartup = deferStartupTaskDrain(async () => {
+    // Construct routes while held, but do not initialize arbitrary plugin or
+    // connector automation until the board explicitly releases this process.
+    if (startupWasHeld) await reconcilePluginJobsAfterStartupHold({ db, scheduler, jobStore });
+    jobCoordinator.start();
+    scheduler.start();
+    feedbackExportTimer = opts.feedbackExportService
+      ? setInterval(() => { void flushPendingFeedbackExports(); }, FEEDBACK_EXPORT_FLUSH_INTERVAL_MS)
+      : null;
+    feedbackExportTimer?.unref?.();
+    if (opts.feedbackExportService) void flushPendingFeedbackExports();
+    emailChannels.start();
+    chatPublicationTimer = setInterval(() => chatReconciliation.reconcile(), CHAT_PUBLICATION_FLUSH_INTERVAL_MS);
+    chatPublicationTimer.unref?.();
+    chatReconciliation.reconcile();
+    importTransferSweepTimer = setInterval(sweepImportTransferSpools, IMPORT_TRANSFER_SPOOL_SWEEP_INTERVAL_MS);
+    importTransferSweepTimer.unref?.();
+    void recoverImportTransfers();
+    await toolDispatcher.initialize().catch((err) => logger.error({ err }, "Failed to initialize plugin tool dispatcher"));
+    // All plugin/manifest state is read at release time, never cached from the
+    // held boot. A restarted process reconstructs this pass from the database.
+    await ensureBundledPlugins(
     bundledPluginInstalls,
     { registry: pluginRegistry, loader, lifecycle, logger },
     // Managed mode reinstalls soft-uninstalled bundles (the control plane
@@ -1279,6 +1277,8 @@ export async function createApp(
     .catch((err) => {
       logger.error({ err }, "Failed to load ready plugins on startup");
     });
+  });
+  const bundledPluginsStartup = applicationStartup.promise;
   app.locals.bundledPluginsStartup = bundledPluginsStartup;
   // The shutdown hook runs at most once. It caches the in-flight promise, so a
   // second caller (for example the `exit` handler) awaits the same completion
@@ -1286,6 +1286,7 @@ export async function createApp(
   let appServicesShutdown: Promise<void> | null = null;
   const shutdownAppServices = (): Promise<void> => {
     if (appServicesShutdown) return appServicesShutdown;
+    applicationStartup.cancel();
     appServicesShutdown = (async () => {
       // The scheduler tick queries the database. Stop it here, inside the
       // awaited teardown, so no tick runs after the caller ends the pool.

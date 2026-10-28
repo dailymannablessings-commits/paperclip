@@ -1,3 +1,5 @@
+import { conflict } from "../errors.js";
+import { getStartupTaskDrain } from "./startup-task-drain.js";
 /**
  * PluginJobScheduler — tick-based scheduler for plugin scheduled jobs.
  *
@@ -36,7 +38,7 @@
 
 import { and, eq, lte, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { pluginJobs, pluginJobRuns } from "@paperclipai/db";
+import { plugins, pluginJobs, pluginJobRuns } from "@paperclipai/db";
 import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { parseCron, nextCronTick, validateCron } from "./cron.js";
@@ -244,6 +246,7 @@ export function createPluginJobScheduler(
    * A single scheduler tick. Queries for due jobs and dispatches them.
    */
   async function tick(): Promise<void> {
+    if (getStartupTaskDrain()) return;
     // Prevent overlapping ticks (in case a tick takes longer than the interval)
     if (tickInProgress) {
       log.debug("skipping tick — previous tick still in progress");
@@ -260,15 +263,16 @@ export function createPluginJobScheduler(
       // Query for jobs whose nextRunAt has passed and are active.
       // We include jobs with null nextRunAt since they may have just been
       // registered and need their first run calculated.
-      const dueJobs = await db
-        .select()
+      const dueJobs = (await db
+        .select({ job: pluginJobs })
         .from(pluginJobs)
+        .innerJoin(plugins, and(eq(plugins.id, pluginJobs.pluginId), eq(plugins.status, "ready")))
         .where(
           and(
             eq(pluginJobs.status, "active"),
             lte(pluginJobs.nextRunAt, now),
           ),
-        );
+        )).map(({ job }) => job);
 
       if (dueJobs.length === 0) {
         return;
@@ -354,11 +358,18 @@ export function createPluginJobScheduler(
 
     try {
       // 1. Create run record
-      const run = await jobStore.createRun({
-        jobId,
-        pluginId,
-        trigger: "schedule",
+      const run = await db.transaction(async (tx) => {
+        // Serialize a scheduled claim with current durable plugin controls and
+        // the job definition. A stale worker/selection grants no authority.
+        const [currentPlugin] = await tx.select().from(plugins).where(eq(plugins.id, pluginId)).for("share");
+        const [currentJob] = await tx.select().from(pluginJobs).where(and(eq(pluginJobs.id, jobId), eq(pluginJobs.pluginId, pluginId))).for("update");
+        if (getStartupTaskDrain() || currentPlugin?.status !== "ready" || currentJob?.status !== "active" || !currentJob.nextRunAt || currentJob.nextRunAt.getTime() > Date.now()) return null;
+        const active = await tx.select({ id: pluginJobRuns.id }).from(pluginJobRuns).where(and(eq(pluginJobRuns.jobId, jobId), eq(pluginJobRuns.pluginId, pluginId), or(eq(pluginJobRuns.status, "queued"), eq(pluginJobRuns.status, "running")))).limit(1);
+        if (active.length || !workerManager.isRunning(pluginId)) return null;
+        const [claimed] = await tx.insert(pluginJobRuns).values({ jobId, pluginId, trigger: "schedule", status: "queued" }).returning();
+        return claimed;
       });
+      if (!run) return;
       runId = run.id;
 
       jobLog.info({ runId }, "dispatching scheduled job");
@@ -420,9 +431,10 @@ export function createPluginJobScheduler(
       // Remove from active set
       activeJobs.delete(jobId);
 
-      // 5. Always advance the schedule pointer (even on failure)
+      // Advance only an admitted run. A denied/inactive/foreign-owned job
+      // must retain its exact schedule pointer and receipts.
       try {
-        await advanceSchedulePointer(job);
+        if (runId) await advanceSchedulePointer(job);
       } catch (err) {
         jobLog.error(
           { err: err instanceof Error ? err.message : String(err) },
@@ -440,6 +452,7 @@ export function createPluginJobScheduler(
     jobId: string,
     trigger: "manual" | "retry" = "manual",
   ): Promise<TriggerJobResult> {
+    if (getStartupTaskDrain()) throw conflict("Startup task drain blocks plugin job execution until explicit board release");
     const job = await jobStore.getJobById(jobId);
     if (!job) {
       throw new Error(`Job not found: ${jobId}`);
@@ -635,6 +648,7 @@ export function createPluginJobScheduler(
   // -----------------------------------------------------------------------
 
   async function registerPlugin(pluginId: string): Promise<void> {
+    if (getStartupTaskDrain() || !workerManager.isRunning(pluginId)) return;
     log.info({ pluginId }, "registering plugin with job scheduler");
     await ensureNextRunTimestamps(pluginId);
   }
