@@ -2,7 +2,7 @@
 
 import { createRoot } from "react-dom/client";
 import { flushSync } from "react-dom";
-import type { AnchorHTMLAttributes, ReactNode } from "react";
+import { act as reactAct, type AnchorHTMLAttributes, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Issue, Project } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1562,46 +1562,45 @@ describe("IssuesList", () => {
   });
 
   it("keeps rendering local issue batches while the user stays near the bottom", async () => {
-    const manyIssues = Array.from({ length: 420 }, (_, index) =>
-      createIssue({
-        id: `issue-${index + 1}`,
-        identifier: `PAP-${index + 1}`,
-        title: `Issue ${index + 1}`,
-      }),
+    // Drive the real scroll callback deterministically instead of relying on host-clock
+    // animation frames and timer polling under a loaded full-suite worker.
+    const frames = new Map<number, FrameRequestCallback>();
+    let nextFrame = 0;
+    const request = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      const id = ++nextFrame; frames.set(id, callback); return id;
+    });
+    const cancel = vi.spyOn(window, "cancelAnimationFrame").mockImplementation((id) => { frames.delete(id); });
+    const runFrame = async () => {
+      const pending = [...frames.values()]; frames.clear();
+      await reactAct(async () => { for (const callback of pending) callback(0); });
+    };
+    setDocumentScrollMetrics({ innerHeight: 600, scrollY: 0, scrollHeight: 2000 });
+    const manyIssues = Array.from({ length: 260 }, (_, index) =>
+      createIssue({ id: `issue-${index + 1}`, identifier: `PAP-${index + 1}`, title: `Issue ${index + 1}` }),
     );
-
     const { root } = renderWithQueryClient(
-      <IssuesList
-        issues={manyIssues}
-        agents={[]}
-        projects={[]}
-        viewStateKey="paperclip:test-issues"
-        onUpdateIssue={() => undefined}
-      />,
+      <IssuesList issues={manyIssues} agents={[]} projects={[]} viewStateKey="paperclip:test-issues" onUpdateIssue={() => undefined} />,
       container,
     );
-
-    await waitForAssertion(() => {
+    try {
+      await reactAct(async () => { await Promise.resolve(); });
       expect(container.querySelectorAll('[data-testid="issue-row"]')).toHaveLength(100);
-    });
-
-    await flush();
-
-    act(() => {
-      setDocumentScrollMetrics({ innerHeight: 600, scrollY: 1500, scrollHeight: 2000 });
-      window.dispatchEvent(new Event("scroll"));
-    });
-    await flushAnimationFrame();
-
-    await waitForAssertion(() => {
+      expect(frames.size).toBeGreaterThan(0);
+      await runFrame(); // initial position is not near the bottom
+      expect(container.querySelectorAll('[data-testid="issue-row"]')).toHaveLength(100);
+      await reactAct(async () => {
+        setDocumentScrollMetrics({ innerHeight: 600, scrollY: 1500, scrollHeight: 2000 });
+        window.dispatchEvent(new Event("scroll"));
+      });
+      expect(frames.size).toBeGreaterThan(0);
+      await runFrame();
       expect(container.querySelectorAll('[data-testid="issue-row"]')).toHaveLength(250);
-      expect(container.textContent).toContain("Rendering 250 of 420 tasks");
-    });
-
-    act(() => {
-      root.unmount();
-    });
-  });
+      expect(container.textContent).toContain("Rendering 250 of 260 tasks");
+    } finally {
+      await reactAct(async () => root.unmount());
+      request.mockRestore(); cancel.mockRestore();
+    }
+  }, 15_000);
 
   it("waits for the desktop main scroll container before rendering more local rows", async () => {
     const manyIssues = Array.from({ length: 120 }, (_, index) =>

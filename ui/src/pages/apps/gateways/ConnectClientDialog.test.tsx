@@ -1,7 +1,6 @@
 // @vitest-environment jsdom
 
-import { type ReactNode } from "react";
-import { flushSync } from "react-dom";
+import { act, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type {
@@ -150,17 +149,18 @@ describe("ConnectClientDialog", () => {
     root = createRoot(container);
   });
 
-  afterEach(() => {
-    flushSync(() => root.unmount());
-    container.remove();
+  afterEach(async () => {
+    try { await act(async () => root.unmount()); } finally { container.remove(); vi.useRealTimers(); }
   });
 
   it("copies a complete client snippet with the selected token and explains the gateway boundary", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    vi.setSystemTime(new Date("2026-10-29T00:00:00.000Z"));
     const persisted = storedToken();
     const created = { ...persisted, token: "pcgw_FULL_SECRET" } satisfies ToolMcpGatewayTokenCreated;
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
-    flushSync(() => {
+    await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
           <ConnectClientDialog
@@ -173,13 +173,12 @@ describe("ConnectClientDialog", () => {
         </QueryClientProvider>,
       );
     });
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
 
     expect(container.textContent).toContain("does not give it access to Paperclip or skills");
     const copyButton = [...container.querySelectorAll("button")].find((button) => button.textContent?.trim() === "Copy");
     if (!copyButton) throw new Error("snippet copy button missing");
-    copyButton.click();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    expect(copyButton.disabled).toBe(false);
+    await act(async () => { copyButton.click(); });
 
     expect(copyTextMock).toHaveBeenCalledWith(expect.stringContaining('"Authorization": "Bearer pcgw_FULL_SECRET"'));
     expect(copyTextMock).toHaveBeenCalledWith(expect.stringContaining(
