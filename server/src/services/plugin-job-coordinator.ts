@@ -1,3 +1,5 @@
+import { eq } from "drizzle-orm";
+import { plugins } from "@paperclipai/db";
 /**
  * PluginJobCoordinator — bridges the plugin lifecycle manager with the
  * job scheduler and job store.
@@ -257,4 +259,24 @@ export function createPluginJobCoordinator(
       log.info("plugin job coordinator stopped");
     },
   };
+}
+
+/** After a held boot, reconcile from CURRENT persisted plugin state. No event
+ * payload is cached across the hold; a restart reconstructs the same pass.
+ * Lock the canonical plugin row while reconciling ready declarations; inactive
+ * statuses never authorize cancellation of pre-existing foreign receipts. */
+export async function reconcilePluginJobsAfterStartupHold(options: Pick<PluginJobCoordinatorOptions, "db" | "scheduler" | "jobStore">): Promise<void> {
+  const ids = await options.db.select({ id: plugins.id }).from(plugins);
+  for (const { id } of ids) {
+    await options.db.transaction(async (tx) => {
+      const [plugin] = await tx.select().from(plugins).where(eq(plugins.id, id)).for("no key update");
+      if (!plugin) return;
+      if (plugin.status === "ready") {
+        await options.jobStore.syncJobDeclarations(plugin.id, plugin.manifestJson.jobs ?? []);
+        await options.scheduler.registerPlugin(plugin.id);
+      // Inactive status alone is not authority to discard pre-existing
+      // foreign run receipts. A new explicit lifecycle action may settle them.
+      }
+    });
+  }
 }

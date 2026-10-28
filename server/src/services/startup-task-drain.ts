@@ -18,6 +18,27 @@ export function getStartupTaskDrain(): { startedAt: Date } | null {
 
 export function releaseStartupTaskDrain(): void {
   startupDrain = null;
+  for (const release of releaseWaiters) release();
+  releaseWaiters.clear();
 }
 
 export function startupTaskDrainConfigured(): boolean { return configured; }
+
+const releaseWaiters = new Set<() => void>();
+
+/** Defer automatic service initialization, reading durable state only when run.
+ * Cancellation prevents an app stopped while held from starting later. */
+export function deferStartupTaskDrain(work: () => Promise<void>): { promise: Promise<void>; cancel: () => void } {
+  let cancelled = false;
+  let release: (() => void) | undefined;
+  const run = async () => {
+    while (!cancelled && getStartupTaskDrain()) {
+      await new Promise<void>((resolve) => { release = resolve; releaseWaiters.add(resolve); });
+    }
+    if (!cancelled) await work();
+  };
+  return {
+    promise: run(),
+    cancel: () => { cancelled = true; if (release) { releaseWaiters.delete(release); release(); } },
+  };
+}

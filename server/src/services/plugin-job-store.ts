@@ -167,15 +167,14 @@ export function pluginJobStore(db: Db) {
         const schedule = decl.schedule ?? "";
 
         if (existing) {
-          // Update schedule if it changed; re-activate if it was paused
+          // Manifest refresh must not revoke an existing operator pause. The
+          // stored state cannot distinguish a manual pause from a retired
+          // declaration; only the explicit resume operation grants activation.
           const updates: Record<string, unknown> = {
             updatedAt: new Date(),
           };
           if (existing.schedule !== schedule) {
             updates.schedule = schedule;
-          }
-          if (existing.status === "paused") {
-            updates.status = "active";
           }
 
           await db

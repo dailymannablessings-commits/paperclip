@@ -1,3 +1,5 @@
+import { getStartupTaskDrain } from "./startup-task-drain.js";
+import { conflict } from "../errors.js";
 /**
  * PluginWorkerManager — spawns and manages out-of-process plugin worker child
  * processes, routes JSON-RPC 2.0 calls over stdio, and handles lifecycle
@@ -3641,6 +3643,7 @@ export function createPluginWorkerManager(
       pluginId: string,
       options: WorkerStartOptions,
     ): Promise<PluginWorkerHandle> {
+      if (getStartupTaskDrain()) throw conflict("Startup task drain blocks plugin workers until explicit board release");
       // Mutex: if a start is already in-flight for this plugin, wait for it
       const inFlight = startupLocks.get(pluginId);
       if (inFlight) {

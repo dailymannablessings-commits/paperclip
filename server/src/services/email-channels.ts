@@ -1,3 +1,4 @@
+import { getStartupTaskDrain } from "./startup-task-drain.js";
 import { HttpError } from "../errors.js";
 import { createHash, randomUUID } from "node:crypto";
 import WebSocket from "ws";
@@ -2061,7 +2062,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
     }
   }
   async function runTick() {
-    if (ticking || stopped) return;
+    if (ticking || stopped || getStartupTaskDrain()) return;
     ticking = true;
     try {
       if (!(await enabled())) {

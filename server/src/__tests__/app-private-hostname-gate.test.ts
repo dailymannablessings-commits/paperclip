@@ -1,3 +1,4 @@
+import { initializeStartupTaskDrain, releaseStartupTaskDrain } from "../services/startup-task-drain.js";
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -6,6 +7,19 @@ import {
 } from "../app.ts";
 
 describe("createChatReconciliationCoordinator", () => {
+  it("holds automatic chat recovery, publication signals and delivery lanes until explicit release", async () => {
+    const work = vi.fn(async () => undefined);
+    const coordinator = createChatReconciliationCoordinator({ reconcileProviderRuntimes: work, processPendingDeliveries: work, projectRunMilestones: async () => { await work(); return 0; }, flushPublications: work, processPendingSlackFileUploadReceipts: work, processPendingSlackSessionSyncs: work, onError: () => undefined });
+    try {
+      initializeStartupTaskDrain({ PAPERCLIP_STARTUP_TASK_DRAIN: "1" });
+      coordinator.reconcile(); coordinator.notifyPublications();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(work).not.toHaveBeenCalled();
+      releaseStartupTaskDrain();
+      coordinator.reconcile();
+      await vi.waitFor(() => expect(work).toHaveBeenCalled());
+    } finally { releaseStartupTaskDrain(); coordinator.stop(); await coordinator.drain(); }
+  });
   it.each([false, true])(
     "keeps later inbound sweeps independent of GitHub recovery and joins shutdown (rejects: %s)",
     async (rejects) => {

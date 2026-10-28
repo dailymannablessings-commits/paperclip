@@ -1,5 +1,5 @@
 /// <reference path="./types/express.d.ts" />
-import { initializeStartupTaskDrain, getStartupTaskDrain } from "./services/startup-task-drain.js";
+import { initializeStartupTaskDrain, getStartupTaskDrain, startupTaskDrainConfigured } from "./services/startup-task-drain.js";
 // Kicks off the OTel bootstrap as early as possible (no-op unless
 // OTEL_EXPORTER_OTLP_ENDPOINT is set). startServer() awaits
 // instrumentationReady before opening DB connections or constructing the
@@ -1873,6 +1873,11 @@ async function startServerWithDatabaseTeardown(
     logger.error({ err }, "failed to reconcile adapter availability from PAPERCLIP_ADAPTERS");
     throw err;
   }
+
+  // A configured held boot exposes the bound board/health APIs while this
+  // promise waits. Readiness must not claim plugin/provider initialization
+  // completed before the owner explicitly releases the startup hold.
+  if (startupTaskDrainConfigured()) await app.locals.bundledPluginsStartup;
 
   setStartupRecoveryPhase("ready");
   logger.info(`Server startup recovery complete on ${config.host}:${listenPort}`);

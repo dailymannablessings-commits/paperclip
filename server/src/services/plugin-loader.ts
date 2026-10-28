@@ -1,3 +1,5 @@
+import { getStartupTaskDrain } from "./startup-task-drain.js";
+import { conflict } from "../errors.js";
 /**
  * PluginLoader — discovery, installation, and runtime activation of plugins.
  *
@@ -1935,6 +1937,7 @@ export function pluginLoader(
      * @returns A promise that resolves with summary statistics of the load operation.
      */
     async loadAll(): Promise<PluginLoadAllResult> {
+      if (getStartupTaskDrain()) throw conflict("Startup task drain blocks plugin activation until explicit board release");
       if (!runtimeServices) {
         throw new Error(
           "Cannot loadAll: no PluginRuntimeServices provided. " +
@@ -2044,6 +2047,7 @@ export function pluginLoader(
      * @returns A promise that resolves with the result of the activation.
      */
     async loadSingle(pluginId: string, options: PluginLoadSingleOptions = {}): Promise<PluginLoadResult> {
+      if (getStartupTaskDrain()) throw conflict("Startup task drain blocks plugin activation until explicit board release");
       if (!runtimeServices) {
         throw new Error(
           "Cannot loadSingle: no PluginRuntimeServices provided. " +

@@ -1489,3 +1489,20 @@ operator explicitly releases the current process with the existing audited
 finite TTL. Restarting while configured re-arms it, including after a prior DELETE.
 Remove the launcher setting only in a separately coordinated verified operation.
 Never substitute a worktree or database-restore flag for this control.
+
+The hold also defers application plugin/coordinator/connector initialization;
+no plugin startup code or automatic email/chat delivery runs before release.
+Incoming supported webhook receipts remain durable. Manual plugin activation
+and job execution return a conflict while held. After release the initialization
+pass reads current persisted plugin/job configuration, including operator pauses;
+it does not replay stale startup event payloads. Stopping a held app cancels its
+pending initialization. A replacement held process reconstructs it from the DB.
+
+The HTTP listener and authorized board APIs are available during this phase,
+including the task-drain GET/DELETE and bounded-role control-seal GET. Health
+honestly reports `starting`/`recovering`; a configured boot becomes ready only
+after explicit release and its plugin/provider bootstrap promise completes.
+Unavailable providers remain explicitly degraded under existing provider policy.
+Before stopping the old service, prove quiescence of plugin jobs, email/chat/tool
+delivery processors and import operations as well as heartbeat/native runs. An
+old-process heartbeat drain alone cannot establish that broader quiet window.
