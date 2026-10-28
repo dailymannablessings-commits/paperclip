@@ -1483,8 +1483,9 @@ async function startServerWithDatabaseTeardown(
       heartbeat.drainActiveRunExecutions();
     prepareHotRestartShutdown = startupTaskDrainConfigured() ? async (signal) => {
       await waitForStartupOperations();
-      ownedShutdownRunIds = await heartbeat.claimOwnedShutdownRunIds();
-      return heartbeat.prepareHotRestartShutdown(signal, new Date(), ownedShutdownRunIds, true);
+      const prepared = await heartbeat.prepareOwnedShutdown();
+      ownedShutdownRunIds = prepared.activeRunIds;
+      return prepared;
     } : heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });

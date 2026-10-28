@@ -1,3 +1,4 @@
+import { commitOwnedNativeShutdown } from "./owned-native-shutdown.js";
 import { getStartupTaskDrain, releaseStartupTaskDrain, startupTaskDrainConfigured } from "./startup-task-drain.js";
 import {createTaskExecutionLease,settleOwnedInvalidTaskExecutionChild,hasTaskExecutionLeaseAncestor,canonicalTaskExecutionLease,hasTaskExecutionLease,validTaskExecutionLease,releaseTaskExecutionLease,stripTaskExecutionLease} from "./heartbeat/task-execution-lease-store.js";
 import {PAUSED_TASK_LEASE_KEY,type PausedExecutionRequest,type PausedTaskLease} from "./heartbeat/paused-task-execution.js";
@@ -75,6 +76,7 @@ import {
   notInArray,
   or,
   sql,
+  type SQL,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -202,7 +204,6 @@ import {
   closeWarmNativeSessionsForEnvironment,
   closeIdleWarmNativeSessionsForRestart,
   currentNativeControllerIdentity,
-  renewNativeSessionExecutionLease,
   dispatchNativeSessionResumptions,
   detachNativeSessionsForRestart,
   ensureNativeCompletionContract,
@@ -8821,6 +8822,7 @@ async function terminateHeartbeatRunProcess(input: {
   processGroupId: number | null | undefined;
   graceMs?: number;
   signal?: NodeJS.Signals;
+  beforeSignal?: () => Promise<void>;
 }) {
   const pid = input.pid ?? null;
   const processGroupId = input.processGroupId ?? null;
@@ -8839,7 +8841,7 @@ async function terminateHeartbeatRunProcess(input: {
           ? processGroupId
           : null,
     },
-    { forceAfterMs: input.graceMs, signal: input.signal },
+    { forceAfterMs: input.graceMs, signal: input.signal, beforeSignal: input.beforeSignal },
   );
 }
 
@@ -12691,8 +12693,9 @@ export function heartbeatService(
     runId: string,
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    ownershipCondition?: SQL,
   ) {
-    return setRunStatusFromLive(runId, status, ["running"], patch);
+    return setRunStatusFromLive(runId, status, ["running"], patch, ownershipCondition);
   }
 
   // Move a run to a new status only when its current status is one of
@@ -12705,6 +12708,7 @@ export function heartbeatService(
     status: string,
     fromStatuses: string[],
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    ownershipCondition?: SQL,
   ) {
     // fromStatuses can name a terminal status as its own source (for example,
     // an idempotent "still failed" patch), so the write below is not always a
@@ -12746,6 +12750,7 @@ export function heartbeatService(
             status,
             patch,
             fromStatuses,
+            ownershipCondition,
           })
         : await db
             .update(heartbeatRuns)
@@ -12759,6 +12764,7 @@ export function heartbeatService(
               and(
                 eq(heartbeatRuns.id, runId),
                 inArray(heartbeatRuns.status, fromStatuses),
+                ownershipCondition,
                 ...(isHeartbeatRunTerminalStatus(status)
                   ? [nativeRunnerOwnershipNotHeldCondition()]
                   : []),
@@ -14323,13 +14329,22 @@ export function heartbeatService(
           eq(nativeRunFinalizations.issueId, run.nativeIssueId)))
         .then((rows) => rows[0] ?? null);
       if (!coordinator?.leaseOwner || coordinator.resultId) continue;
-      try {
-        await renewNativeSessionExecutionLease({ db, runId: id, companyId: run.companyId,
-          issueId: run.nativeIssueId, leaseOwner: coordinator.leaseOwner, attempt: coordinator.attempt });
-        owned.push(id);
-      } catch (error) {
-        if (!(error instanceof Error) || error.message !== "native_session_lease_lost") throw error;
-      }
+      const controller = await currentNativeControllerIdentity();
+      const [renewed] = await db.update(nativeRunFinalizations).set({
+        leaseExpiresAt: sql`greatest(${nativeRunFinalizations.leaseExpiresAt}, clock_timestamp() + interval '60 seconds')`,
+        updatedAt: sql`clock_timestamp()`,
+      }).where(and(eq(nativeRunFinalizations.runId, id), eq(nativeRunFinalizations.companyId, run.companyId),
+        eq(nativeRunFinalizations.issueId, run.nativeIssueId), eq(nativeRunFinalizations.leaseOwner, coordinator.leaseOwner),
+        eq(nativeRunFinalizations.attempt, coordinator.attempt),
+        eq(nativeRunFinalizations.controllerGeneration, coordinator.controllerGeneration),
+        eq(nativeRunFinalizations.controllerBootId, controller.bootId), eq(nativeRunFinalizations.controllerPid, controller.pid),
+        eq(nativeRunFinalizations.controllerProcessStartedAt, controller.processStartedAt),
+        gt(nativeRunFinalizations.leaseExpiresAt, sql`clock_timestamp()`), isNull(nativeRunFinalizations.resultId),
+        sql`exists (select 1 from ${heartbeatRuns} where ${heartbeatRuns.id} = ${id}
+          and ${heartbeatRuns.companyId} = ${run.companyId} and ${heartbeatRuns.runtimeMode} = 'native'
+          and ${heartbeatRuns.status} = 'running')`,
+      )).returning({ id: nativeRunFinalizations.runId });
+      if (renewed) owned.push(id);
     }
     return owned;
   }
@@ -14337,16 +14352,8 @@ export function heartbeatService(
   async function prepareHotRestartShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
-    runIds: readonly string[] | null = null,
-    requireOwnedExecution = false,
   ) {
     shutdownInProgress = true;
-    const selectedRunIds = requireOwnedExecution
-      ? await claimOwnedShutdownRunIds(runIds ?? [])
-      : runIds ? [...new Set(runIds)] : null;
-    if (selectedRunIds?.length === 0) return {
-      mode: "no_owned_runs" as const, skipDrain: true as const, activeRunIds: [] as string[],
-    };
     const idleSessions = await closeIdleWarmNativeSessionsForRestart();
     if (idleSessions.failed > 0) {
       logger.warn({ idleSessions }, "idle native sessions could not checkpoint before controller shutdown");
@@ -14398,7 +14405,7 @@ export function heartbeatService(
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-      .where(selectedRunIds ? and(eq(heartbeatRuns.status, "running"), inArray(heartbeatRuns.id, selectedRunIds)) : eq(heartbeatRuns.status, "running"));
+      .where(eq(heartbeatRuns.status, "running"));
     const snapshotRuns = activeRuns.map(toHotRestartIntentRun);
     const intentWithVersion = {
       ...intent,
@@ -14988,7 +14995,16 @@ export function heartbeatService(
         // hot restart. Leaving the old event consumer attached lets its
         // finalizer interrupt/suspend Claude while the next server is adopting
         // the same turn.
-        await detachNativeSessionsForRestart([run.id]);
+        const controller = requireOwnedExecution ? await currentNativeControllerIdentity() : null;
+        const receipt = requireOwnedExecution ? await db.select().from(nativeRunFinalizations)
+          .where(and(eq(nativeRunFinalizations.runId, run.id), eq(nativeRunFinalizations.companyId, run.companyId),
+            eq(nativeRunFinalizations.controllerBootId, controller!.bootId),
+            eq(nativeRunFinalizations.controllerPid, controller!.pid),
+            eq(nativeRunFinalizations.controllerProcessStartedAt, controller!.processStartedAt),
+            gt(nativeRunFinalizations.leaseExpiresAt, sql`clock_timestamp()`), isNull(nativeRunFinalizations.resultId)))
+          .then((rows) => rows[0] ?? null) : null;
+        if (requireOwnedExecution && !receipt?.leaseOwner) continue;
+        if (!requireOwnedExecution) await detachNativeSessionsForRestart([run.id]);
         const recoveryHistoryEntry = JSON.stringify({
           at: now.toISOString(),
           restartKind: "graceful",
@@ -14997,7 +15013,16 @@ export function heartbeatService(
           processPid: run.processPid,
           processStartedAt: run.processStartedAt?.toISOString() ?? null,
         });
-        await db
+        const ownedTransition = requireOwnedExecution ? await commitOwnedNativeShutdown({
+          db, runId: run.id, companyId: run.companyId, issueId: run.nativeIssueId!, now,
+          historyEntry: JSON.parse(recoveryHistoryEntry), receipt: {
+            leaseOwner: receipt!.leaseOwner!, attempt: receipt!.attempt,
+            controllerGeneration: receipt!.controllerGeneration,
+            controllerBootId: controller!.bootId, controllerPid: controller!.pid,
+            controllerProcessStartedAt: controller!.processStartedAt,
+          },
+        }) : null;
+        const transitioned = requireOwnedExecution ? (ownedTransition ? [{ id: ownedTransition.runId }] : []) : await db
           .update(nativeRunFinalizations)
           .set({
             recoveryState: "awaiting_runner_reattach",
@@ -15022,7 +15047,9 @@ export function heartbeatService(
               eq(nativeRunFinalizations.runId, run.id),
               isNull(nativeRunFinalizations.resultId),
             ),
-          );
+          ).returning({ id: nativeRunFinalizations.runId });
+        if (requireOwnedExecution && transitioned.length === 0) continue;
+        if (requireOwnedExecution) await detachNativeSessionsForRestart([run.id]);
         await appendRunEvent(run, {
           eventType: "native.recovery.transition",
           stream: "system",
@@ -15058,10 +15085,17 @@ export function heartbeatService(
             pid: running.child.pid,
             processGroupId: running.processGroupId,
             graceMs: Math.max(1, running.graceSec) * 1000,
+            beforeSignal: requireOwnedExecution ? async () => {
+              if (!(await claimOwnedShutdownRunIds([run.id])).includes(run.id))
+                throw new Error("owned_shutdown_authority_lost");
+            } : undefined,
           });
         }
+      } catch (error) {
+        if (requireOwnedExecution && error instanceof Error && error.message === "owned_shutdown_authority_lost") continue;
+        throw error;
       } finally {
-        runningProcesses.delete(run.id);
+        if (!requireOwnedExecution || !running?.child.pid || !isProcessAlive(running.child.pid)) runningProcesses.delete(run.id);
       }
 
       const persistedCancellationResult =
@@ -15086,6 +15120,9 @@ export function heartbeatService(
             errorMessage: message,
           }),
         },
+        requireOwnedExecution ? and(eq(heartbeatRuns.runtimeMode, "legacy"),
+          eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
+          gt(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`)) : undefined,
       );
       if (!interruptedStatus.updated || !interruptedStatus.run) continue;
       let interrupted = interruptedStatus.run;
@@ -22455,7 +22492,10 @@ export function heartbeatService(
             lastOutputBytes: pendingOutputProgress.bytes,
             updatedAt: new Date(),
           })
-          .where(eq(heartbeatRuns.id, run.id));
+          .where(and(eq(heartbeatRuns.id, run.id),
+            startupTaskDrainConfigured() && run.runtimeMode === "legacy" ? and(
+              eq(heartbeatRuns.runtimeMode, "legacy"), eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
+              gt(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`)) : undefined));
         lastOutputFlushAt = pendingOutputProgress.at;
         outputProgressState.pending = null;
       };
@@ -24132,6 +24172,8 @@ export function heartbeatService(
             if (!guardedDispatch.dispatched) return;
             adapterResult = await guardedDispatch.resultPromise;
           }
+          if (startupTaskDrainConfigured() && run.runtimeMode === "legacy" &&
+              !await renewLegacyControllerLease(db, run)) return;
           // Adapter returned cleanly, which means its workspace-restore finally
           // block also ran without throwing. Record the workspace_finalize
           // barrier so dependents that share this executionWorkspace can wake.
@@ -24175,6 +24217,8 @@ export function heartbeatService(
             }
           }
         } catch (adapterErr) {
+          if (startupTaskDrainConfigured() && run.runtimeMode === "legacy" &&
+              !await renewLegacyControllerLease(db, run)) return;
           if (adapterErr instanceof NativeControllerDetachedForRestartError) {
             // Preserve the provider and its run for the new controller. This
             // also keeps generic teardown from terminalizing/releasing its lease.
@@ -24628,7 +24672,7 @@ export function heartbeatService(
         const persistedRunWrite = await setRunStatusIfRunning(
           run.id,
           status,
-          finalRunPatch,
+          finalRunPatch, startupTaskDrainConfigured() && run.runtimeMode === "legacy" ? and(eq(heartbeatRuns.runtimeMode, "legacy"), eq(heartbeatRuns.controllerBootId, legacyControllerBootId), gt(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`)) : undefined,
         );
         let persistedRun: typeof heartbeatRuns.$inferSelect | null =
           persistedRunWrite.run;
@@ -25251,7 +25295,7 @@ export function heartbeatService(
           logBytes: logSummary?.bytes,
           logSha256: logSummary?.sha256,
           logCompressed: logSummary?.compressed ?? false,
-        });
+        }, startupTaskDrainConfigured() && run.runtimeMode === "legacy" ? and(eq(heartbeatRuns.runtimeMode, "legacy"), eq(heartbeatRuns.controllerBootId, legacyControllerBootId), gt(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`)) : undefined);
         if (
           !failedRunWrite.updated &&
           !(
@@ -25496,7 +25540,7 @@ export function heartbeatService(
             : setupFailureResultJson
               ? { resultJson: setupFailureResultJson }
               : {}),
-        }).catch(() => ({ run: null, updated: false as const }));
+        }, startupTaskDrainConfigured() && run.runtimeMode === "legacy" ? and(eq(heartbeatRuns.runtimeMode, "legacy"), eq(heartbeatRuns.controllerBootId, legacyControllerBootId), gt(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`)) : undefined).catch(() => ({ run: null, updated: false as const }));
         if (!setupFailureWrite.updated) {
           logger.info(
             {
@@ -25615,7 +25659,13 @@ export function heartbeatService(
       if(taskLeaseExpiryTimer)clearTimeout(taskLeaseExpiryTimer);
       if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);
+      const lostConfiguredLegacyOwnership = startupTaskDrainConfigured() && run.runtimeMode === "legacy" &&
+        Boolean(latestRun && !isHeartbeatRunTerminalStatus(latestRun.status) &&
+          (latestRun.runtimeMode !== "legacy" || latestRun.controllerBootId !== legacyControllerBootId ||
+           !latestRun.controllerLeaseExpiresAt || latestRun.controllerLeaseExpiresAt.getTime() <= Date.now()));
       try {
+        if (!lostConfiguredLegacyOwnership) {
+
         if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
           await db
             .update(heartbeatRuns)
@@ -25779,7 +25829,9 @@ export function heartbeatService(
               ${JSON.stringify({ startupPreparationSettledAt: new Date().toISOString() })}::jsonb`,
           }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "cancelled")));
         }
-      } finally {
+
+        }
+} finally {
         controllerLease.stop();
         activeRunExecutions.delete(run.id);
         // A failed owned Stop remains visible until this exact executor settles,
@@ -25793,7 +25845,7 @@ export function heartbeatService(
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
-      if (!hasTaskExecutionLease(run) && latestRun?.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(latestRun.status)) {
+      if (!lostConfiguredLegacyOwnership && !hasTaskExecutionLease(run) && latestRun?.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(latestRun.status)) {
         const [pending] = await db.select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
           eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
           eq(agentWakeupRequests.status, "deferred_issue_execution"),
@@ -25808,7 +25860,7 @@ export function heartbeatService(
       if (
         !nativeSessionResumeScheduled &&
         !nativeWorkspaceFinalizeScheduled &&
-        !shutdownInProgress && !hasTaskExecutionLease(run)
+        !lostConfiguredLegacyOwnership && !shutdownInProgress && !hasTaskExecutionLease(run)
       ) {
         if (latestRun) await resumeRemoteStopComments(latestRun).catch(err => {
           logger.warn({ err, runId: run.id }, "failed to resume user messages after remote Stop");
@@ -29184,6 +29236,12 @@ export function heartbeatService(
     reportRunActivity: clearDetachedRunWarning,
 
     claimOwnedShutdownRunIds,
+    prepareOwnedShutdown: async () => {
+      shutdownInProgress = true;
+      const owned = await claimOwnedShutdownRunIds();
+      return { mode: "owned_graceful" as const, skipDrain: false as const,
+        activeRunIds: owned, drainRunIds: owned };
+    },
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     recoverNativeRunsAfterRestart,

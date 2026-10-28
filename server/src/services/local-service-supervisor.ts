@@ -548,7 +548,7 @@ export async function touchLocalServiceRegistryRecord(
 export async function terminateLocalService(
   record: Pick<LocalServiceRegistryRecord, "pid" | "processGroupId"> &
     Partial<Pick<LocalServiceRegistryRecord, "port">>,
-  opts?: { signal?: NodeJS.Signals; forceAfterMs?: number; verifyAfterMs?: number },
+  opts?: { signal?: NodeJS.Signals; forceAfterMs?: number; verifyAfterMs?: number; beforeSignal?: () => Promise<void> },
 ) {
   const signal = opts?.signal ?? "SIGTERM";
   const targetProcessGroup = process.platform !== "win32" && record.processGroupId && record.processGroupId > 0;
@@ -574,6 +574,7 @@ export async function terminateLocalService(
     return await targetIsGone();
   };
 
+  await opts?.beforeSignal?.();
   try {
     if (targetProcessGroup) {
       process.kill(-record.processGroupId!, signal);
@@ -585,6 +586,7 @@ export async function terminateLocalService(
   }
 
   if (await waitUntilGone(opts?.forceAfterMs ?? 2_000)) return;
+  await opts?.beforeSignal?.();
   try {
     if (targetProcessGroup) {
       process.kill(-record.processGroupId!, "SIGKILL");

@@ -1505,10 +1505,13 @@ initialization and admitted startup database operations settle before disposing
 hosts, pools and the owned database provider. Every admitted startup phase checks
 cancellation before the next phase; detached reconciliations are tracked too.
 Ordinary unconfigured shutdown does not wait on an unfinished plugin initializer. A stopped boot never advertises ready; repeated signals share one
-teardown. Configured replacement shutdown scopes heartbeat preparation and drain
+teardown. Configured replacement shutdown uses scoped graceful drain instead of the global
+hot-restart intent/snapshot path. It scopes heartbeat preparation and drain
 to this process's admitted executions with freshly renewed canonical controller
 leases. Empty ownership never grants authority over persisted foreign/null-owner
-runs or their human wake requests. Require the full coordinated quiet-window proof before stopping
+runs or their human wake requests. Process signals recheck authority; durable
+terminal/handoff writes compare the current controller lease atomically. A lost
+controller leaves the new owner's run, wake and environment-lease receipts intact. Require the full coordinated quiet-window proof before stopping
 either the old service or a replacement, including active foreign work.
 
 The HTTP listener and authorized board APIs are available during this phase,

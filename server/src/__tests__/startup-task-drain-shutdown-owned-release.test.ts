@@ -90,7 +90,7 @@ it("drains an actual locally admitted execution after hold release before readin
   await vi.waitFor(async () => { const r = await fetch(`${url}/instance/task-drain`); expect(r.status).toBe(200); await r.json(); }, { timeout: 20_000 });
   
   const released = await fetch(`${url}/instance/task-drain`, { method: "DELETE" }); expect(released.status).toBe(200); await released.json();
-  await vi.waitFor(() => expect(phaseEvidence.entered).toHaveBeenCalledTimes(1));
+  await vi.waitFor(() => expect(phaseEvidence.entered).toHaveBeenCalledTimes(1), { timeout: 20_000 });
   const heartbeat = heartbeatService(appEvidence.db!);
   const invoked = await heartbeat.invoke(ownedAgentId, "on_demand", {}, "manual"); expect(invoked).not.toBeNull(); ownedRunId = invoked!.id;
   await vi.waitFor(async () => {

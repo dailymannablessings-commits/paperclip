@@ -1,7 +1,7 @@
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
@@ -55,6 +55,7 @@ export async function terminalizeLegacyExecution(input: {
   status: string;
   patch?: Partial<typeof heartbeatRuns.$inferInsert>;
   fromStatuses?: string[];
+  ownershipCondition?: SQL;
 }) {
   const { db, run, status, patch } = input;
   const issueId =
@@ -88,6 +89,7 @@ export async function terminalizeLegacyExecution(input: {
           eq(heartbeatRuns.id, run.id),
           eq(heartbeatRuns.companyId, run.companyId),
           inArray(heartbeatRuns.status, input.fromStatuses ?? [run.status]),
+          input.ownershipCondition,
         ),
       )
       .returning();
