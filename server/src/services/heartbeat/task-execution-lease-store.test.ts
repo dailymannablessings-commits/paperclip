@@ -8,10 +8,11 @@ import {setupRunnerPrpWebSocketServer,runnerPrpWebSocketInternals} from '../../r
 import {processAdapter} from '../../adapters/process/index.js';
 import {heartbeatService} from '../heartbeat.js';
 import {PaperclipRunnerSemanticAuthority} from '../native-runtime/runner-semantic-authority.js';
+import {reconcileSafeNativeReplacements} from '../native-runtime/native-safe-replacement.js';
 import {beforeAll,afterAll,afterEach,describe,it,expect} from 'vitest';
 import {eq,and,sql} from 'drizzle-orm';
-import {createDb,startEmbeddedPostgresTestDatabase,agents,companies,issues,agentWakeupRequests,heartbeatRuns,activityLog,completionContracts,nativeRunFinalizations,agentTaskSessions} from '@paperclipai/db';
-import {createTaskExecutionLease,validTaskExecutionLease,releaseTaskExecutionLease,stripTaskExecutionLease} from './task-execution-lease-store.js';
+import {createDb,startEmbeddedPostgresTestDatabase,agents,companies,issues,agentWakeupRequests,heartbeatRuns,activityLog,completionContracts,nativeRunFinalizations,agentTaskSessions,issueComments} from '@paperclipai/db';
+import {hasTaskExecutionLeaseAncestor,settleOwnedInvalidTaskExecutionChild,createTaskExecutionLease,validTaskExecutionLease,releaseTaskExecutionLease,stripTaskExecutionLease} from './task-execution-lease-store.js';
 import {executionControlHash,PAUSED_TASK_LEASE_KEY} from './paused-task-execution.js';
 
 describe('task execution lease PostgreSQL admission',()=>{
@@ -241,4 +242,107 @@ describe('task execution lease PostgreSQL admission',()=>{
   }finally{await service.drainActiveRunExecutions()}
  });
  it('ordinary wake context/payload cannot smuggle a lease',()=>{const context={[PAUSED_TASK_LEASE_KEY]:{forged:true},issueId:'preserved'};const payload={[PAUSED_TASK_LEASE_KEY]:{forged:true},commentId:'preserved'};stripTaskExecutionLease(context,payload);expect(context).toEqual({issueId:'preserved'});expect(payload).toEqual({commentId:'preserved'})});
+ it.each(['idle','paused'] as const)('native safe replacement cannot manufacture a child of a canonical %s board lease',async status=>{
+  const f=await fixture(status);const parent=await createTaskExecutionLease(db,f);
+  await db.update(heartbeatRuns).set({status:'failed',runtimeMode:'native',nativeIssueId:f.request.issueId,runnerProfileJson:{recoveryEventInventoryVersion:1,nativeExecutionInput:{provider:{kind:'codex'},workspace:{cwd:tmpdir()}}}}).where(eq(heartbeatRuns.id,parent.id));
+  await db.insert(nativeRunFinalizations).values({runId:parent.id,companyId:f.companyId,issueId:f.request.issueId,phase:'terminal_failure',attempt:1,failureCode:'native_provider_terminal_failed',failureDetail:{originalFailureCode:'fixture_checkpoint_unusable'}});
+  const beforeTask=(await db.select().from(issues).where(eq(issues.id,f.request.issueId)))[0];
+  const beforeWake=(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id,parent.wakeupRequestId!)))[0];
+  await reconcileSafeNativeReplacements(db);await reconcileSafeNativeReplacements(db);
+  expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId,parent.id))).toHaveLength(0);
+  expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId,f.agentId))).toHaveLength(1);
+  expect((await db.select().from(issues).where(eq(issues.id,f.request.issueId)))[0]).toEqual(beforeTask);
+  expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id,parent.wakeupRequestId!)))[0]).toEqual(beforeWake);
+ });
+ it('refuses a second board lease while prior lease-shaped work is scheduled for retry',async()=>{
+  const f=await fixture();const parent=await createTaskExecutionLease(db,f);
+  await db.update(heartbeatRuns).set({status:'scheduled_retry'}).where(eq(heartbeatRuns.id,parent.id));
+  const issueId=randomUUID();await db.insert(issues).values({id:issueId,companyId:f.companyId,title:'Second synthetic task',status:'backlog'});
+  await expect(createTaskExecutionLease(db,{...f,request:{...f.request,issueId,idempotencyKey:randomUUID()}})).rejects.toThrow();
+  expect((await db.select().from(issues).where(eq(issues.id,issueId)))[0]).toMatchObject({status:'backlog',assigneeAgentId:null,assigneeAdapterOverrides:null});
+  expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId,f.agentId))).toHaveLength(1);
+ });
+ it.each(['retryOfRunId','sourceRunId','parentRunId','predecessorRunId','goalRolloverFromRunId'])('blocks actual cross-agent unmarked queued descendants through %s after the board run finishes',async alias=>{
+  const f=await fixture('idle',{},'process');const parent=await createTaskExecutionLease(db,f);
+  await db.update(heartbeatRuns).set({status:'succeeded',finishedAt:new Date()}).where(eq(heartbeatRuns.id,parent.id));
+  const childAgentId=randomUUID();
+  await db.insert(agents).values({id:childAgentId,companyId:f.companyId,name:'Synthetic foreign child',role:'engineer',status:'idle',adapterType:'process',adapterConfig:{command:'/usr/bin/true'},runtimeConfig:{heartbeat:{enabled:false}},permissions:{}});
+  const [wake]=await db.insert(agentWakeupRequests).values({companyId:f.companyId,agentId:childAgentId,source:'automation',triggerDetail:'system',reason:'synthetic-direct-producer',status:'queued',payload:{[alias]:parent.id},requestedByActorType:'system'}).returning();
+  const [child]=await db.insert(heartbeatRuns).values({companyId:f.companyId,agentId:childAgentId,status:'queued',responsibleUserId:f.actorUserId,invocationSource:'automation',triggerDetail:'system',wakeupRequestId:wake.id,contextSnapshot:{syntheticDirectProducer:true}}).returning();
+  await db.update(agentWakeupRequests).set({runId:child.id}).where(eq(agentWakeupRequests.id,wake.id));
+  const service=heartbeatService(db,{runtimeEnv:{}});
+  try{
+   await service.resumeQueuedRuns();await service.drainActiveRunExecutions();
+   expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,child.id)))[0]).toEqual(child);
+   expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id,wake.id)))[0]).toMatchObject({status:'queued',runId:child.id});
+  }finally{await service.drainActiveRunExecutions()}
+ });
+ it.each(['retryOfRunId','sourceRunId','parentRunId','predecessorRunId','goalRolloverFromRunId'])('executes an ordinary non-leased source descendant through %s',async alias=>{
+  const f=await fixture('idle',{},'process');
+  const [parent]=await db.insert(heartbeatRuns).values({companyId:f.companyId,agentId:f.agentId,status:'succeeded',responsibleUserId:f.actorUserId,invocationSource:'automation',finishedAt:new Date(),contextSnapshot:{ordinarySource:true}}).returning();
+  const [wake]=await db.insert(agentWakeupRequests).values({companyId:f.companyId,agentId:f.agentId,source:'automation',triggerDetail:'system',reason:'synthetic-ordinary-producer',status:'queued',payload:{[alias]:parent.id},requestedByActorType:'system'}).returning();
+  const [child]=await db.insert(heartbeatRuns).values({companyId:f.companyId,agentId:f.agentId,status:'queued',responsibleUserId:f.actorUserId,invocationSource:'automation',triggerDetail:'system',wakeupRequestId:wake.id,contextSnapshot:{syntheticOrdinaryProducer:true}}).returning();
+  await db.update(agentWakeupRequests).set({runId:child.id}).where(eq(agentWakeupRequests.id,wake.id));
+  expect(await hasTaskExecutionLeaseAncestor(db,child)).toBe(false);
+  const service=heartbeatService(db,{runtimeEnv:{}});
+  try{await service.resumeQueuedRuns();await service.drainActiveRunExecutions();expect(await service.getRun(child.id)).toMatchObject({status:'succeeded',exitCode:0});}finally{await service.drainActiveRunExecutions()}
+ },20_000);
+ it('denies native semantic authority to an already-running unmarked descendant of a terminal board run',async()=>{
+  const f=await fixture('idle');const parent=await createTaskExecutionLease(db,f);
+  await db.update(heartbeatRuns).set({status:'succeeded'}).where(eq(heartbeatRuns.id,parent.id));
+  const [child]=await db.insert(heartbeatRuns).values({companyId:f.companyId,agentId:f.agentId,status:'running',invocationSource:'automation',triggerDetail:'system',runtimeMode:'native',nativeIssueId:f.request.issueId,retryOfRunId:parent.id,contextSnapshot:{issueId:f.request.issueId}}).returning();
+  await db.update(issues).set({executionRunId:child.id}).where(eq(issues.id,f.request.issueId));
+  const authority=new PaperclipRunnerSemanticAuthority(db,{companyId:f.companyId,agentId:f.agentId,issueId:f.request.issueId,runId:child.id});
+  expect(await authority.dispatch({callId:'forbidden-child-read',operationId:'get_task_context',correlation:{runId:child.id,normalizedSessionId:randomUUID(),turnId:'turn-1',itemId:'item-1'},input:{}})).toMatchObject({ok:false});
+ });
+
+ it.each(['owned','foreign_actor','foreign_wake','changed_receipt','live_pid','live_native','started','manual','forged_parent','missing_native_receipt','wrong_native_receipt'] as const)('settles only proven unstarted native copied children: %s',async variant=>{
+  const f=await fixture();const parent=await createTaskExecutionLease(db,f);
+  await db.update(heartbeatRuns).set({status:'failed',runtimeMode:'native',nativeIssueId:f.request.issueId}).where(eq(heartbeatRuns.id,parent.id));
+  const payload={...parent.contextSnapshot,retryOfRunId:parent.id};
+  const [wake]=await db.insert(agentWakeupRequests).values({companyId:f.companyId,agentId:f.agentId,source:'automation',triggerDetail:'system',reason:'native_safe_replacement',status:'queued',requestedByActorType:variant==='foreign_actor'?'user':'system',idempotencyKey:'native-safe-replacement:'+parent.id,payload}).returning();
+  const [child]=await db.insert(heartbeatRuns).values({companyId:f.companyId,agentId:f.agentId,status:'scheduled_retry',invocationSource:variant==='manual'?'on_demand':'automation',triggerDetail:'system',wakeupRequestId:wake.id,retryOfRunId:parent.id,scheduledRetryReason:'native_safe_replacement',responsibleUserId:f.actorUserId,contextSnapshot:payload,...(variant==='live_pid'?{processPid:12345}:{}),...(variant==='live_native'?{nativeSessionId:randomUUID()}:{}),...(variant==='started'?{startedAt:new Date()}: {})}).returning();
+  if(variant!=='missing_native_receipt')await db.insert(nativeRunFinalizations).values({runId:parent.id,companyId:f.companyId,issueId:f.request.issueId,phase:'terminal_failure',attempt:1,failureDetail:{successorRunId:variant==='wrong_native_receipt'?randomUUID():child.id}});
+  await db.update(agentWakeupRequests).set({runId:variant==='foreign_wake'?parent.id:child.id,...(variant==='changed_receipt'?{payload:{...payload,[PAUSED_TASK_LEASE_KEY]:{forged:true}}}:{})}).where(eq(agentWakeupRequests.id,wake.id));
+  if(variant==='forged_parent')await db.update(agentWakeupRequests).set({source:'automation'}).where(eq(agentWakeupRequests.id,parent.wakeupRequestId!));
+  const beforeRun=(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,child.id)))[0];
+  const beforeWake=(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id,wake.id)))[0];
+  expect(await settleOwnedInvalidTaskExecutionChild(db,child.id)).toBe(variant==='owned');
+  if(variant==='owned'){
+   expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,child.id)))[0]).toMatchObject({status:'cancelled',errorCode:'bounded_task_lease_automatic_child_forbidden'});
+   expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id,wake.id)))[0]).toMatchObject({status:'cancelled'});
+   expect(await settleOwnedInvalidTaskExecutionChild(db,child.id)).toBe(false);
+  }else{
+   expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,child.id)))[0]).toEqual(beforeRun);
+   expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id,wake.id)))[0]).toEqual(beforeWake);
+  }
+ });
+
+ it.each(['commentId','wakeCommentId'] as const)('blocks persisted pre-fix route wakes via canonical %s comment attribution',async alias=>{
+  const f=await fixture('idle',{},'process');const parent=await createTaskExecutionLease(db,f);
+  await db.update(heartbeatRuns).set({status:'succeeded'}).where(eq(heartbeatRuns.id,parent.id));
+  const [comment]=await db.insert(issueComments).values({companyId:f.companyId,issueId:f.request.issueId,authorAgentId:f.agentId,createdByRunId:parent.id,body:'Synthetic historical mention'}).returning();
+  const [wake]=await db.insert(agentWakeupRequests).values({companyId:f.companyId,agentId:f.agentId,source:'automation',triggerDetail:'system',reason:'issue_comment_mentioned',status:'queued',requestedByActorType:'agent',payload:{[alias]:comment.id}}).returning();
+  const [child]=await db.insert(heartbeatRuns).values({companyId:f.companyId,agentId:f.agentId,status:'queued',responsibleUserId:f.actorUserId,invocationSource:'automation',triggerDetail:'system',wakeupRequestId:wake.id,contextSnapshot:{syntheticHistoricalMention:true}}).returning();
+  await db.update(agentWakeupRequests).set({runId:child.id}).where(eq(agentWakeupRequests.id,wake.id));
+  const service=heartbeatService(db,{runtimeEnv:{}});
+  try{await service.resumeQueuedRuns();await service.drainActiveRunExecutions();expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,child.id)))[0]).toEqual(child);}finally{await service.drainActiveRunExecutions()}
+ });
+
+ it('preserves an unproven raw lease-shaped queued run without provider authority',async()=>{
+  const f=await fixture('idle',{},'process');
+  const [wake]=await db.insert(agentWakeupRequests).values({companyId:f.companyId,agentId:f.agentId,source:'automation',triggerDetail:'system',status:'queued',reason:'foreign-owned-input',payload:{[PAUSED_TASK_LEASE_KEY]:{unproven:true}},requestedByActorType:'user'}).returning();
+  const [run]=await db.insert(heartbeatRuns).values({companyId:f.companyId,agentId:f.agentId,status:'queued',responsibleUserId:f.actorUserId,invocationSource:'automation',triggerDetail:'system',wakeupRequestId:wake.id,contextSnapshot:{[PAUSED_TASK_LEASE_KEY]:{unproven:true}}}).returning();
+  await db.update(agentWakeupRequests).set({runId:run.id}).where(eq(agentWakeupRequests.id,wake.id));
+  const service=heartbeatService(db,{runtimeEnv:{}});
+  try{await service.resumeQueuedRuns();await service.drainActiveRunExecutions();expect(await service.getRun(run.id)).toEqual(run);expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id,wake.id)))[0]).toMatchObject({status:'queued',runId:run.id});}finally{await service.drainActiveRunExecutions()}
+ });
+ it.each(['distinct','malformed','duplicate'] as const)('denies overlarge %s comment ancestry without assigning it cancellation ownership',async variant=>{
+  const f=await fixture('idle',{},'process');
+  const [run]=await db.insert(heartbeatRuns).values({companyId:f.companyId,agentId:f.agentId,status:'queued',invocationSource:'automation',contextSnapshot:{commentIds:variant==='distinct'?Array.from({length:65},()=>randomUUID()):Array(66).fill(variant==='malformed'?'invalid-id':randomUUID())}}).returning();
+  expect(await hasTaskExecutionLeaseAncestor(db,run)).toBe(true);
+  expect(await settleOwnedInvalidTaskExecutionChild(db,run.id)).toBe(false);
+  expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,run.id)))[0]).toEqual(run);
+ });
+
 });

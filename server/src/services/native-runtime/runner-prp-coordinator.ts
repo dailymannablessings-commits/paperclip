@@ -1,4 +1,4 @@
-import {validTaskExecutionLease,hasTaskExecutionLease} from "../heartbeat/task-execution-lease-store.js";
+import {hasTaskExecutionLeaseAncestor,validTaskExecutionLease,hasTaskExecutionLease} from "../heartbeat/task-execution-lease-store.js";
 import { resolve } from "node:path";
 
 import { and, eq } from "drizzle-orm";
@@ -209,7 +209,7 @@ export function runnerPrpCoordinator(
       const leased=binding && hasTaskExecutionLease(binding.run);
       const validLease=!!binding && !!leased && await validTaskExecutionLease(db,binding.run);
       if (
-        !binding || (leased && !validLease) ||
+        !binding || await hasTaskExecutionLeaseAncestor(db,binding.run) || (leased && !validLease) ||
         !["queued", "running"].includes(binding.run.status) ||
         binding.run.driverKind !== "codex" ||
         !binding.run.completionContractId ||
